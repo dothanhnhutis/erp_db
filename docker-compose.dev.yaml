@@ -1,0 +1,34 @@
+services:
+  postgres:
+    container_name: postgres_container
+    build: .
+    restart: always
+    environment:
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=secret
+      - POSTGRES_DB=pgdb
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    ports:
+      # Chỉ bind localhost (an toàn cho VPS) — remote thì dùng SSH tunnel (xem BACKUP.md §3).
+      # Muốn mở ra ngoài có chủ đích: đổi thành "5432:5432" và siết firewall theo IP.
+      - 127.0.0.1:5432:5432
+    command: >
+      postgres
+      -c shared_preload_libraries=pg_partman_bgw
+      -c pg_partman_bgw.dbname=pgdb
+      -c pg_partman_bgw.interval=10
+      -c pg_partman_bgw.role=admin
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d
+      # Mount file CSV vào một thư mục tạm trong container để Postgres có thể đọc
+      - ./data:/tmp
+    networks:
+      - mynet
+
+networks:
+  mynet:
+    driver: bridge
+
+volumes:
+  postgres_data:
