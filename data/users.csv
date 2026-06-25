@@ -1,0 +1,2 @@
+id,email,password_hash,username,status
+019c0df7-89b5-7628-a136-d9d9d00bf754,admin@example.com,"$argon2id$v=19$m=65536,t=3,p=4$ZGVtb1NhbHQwMDAwMDAwMA$ZGVtb0hhc2gwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA",admin,ACTIVE

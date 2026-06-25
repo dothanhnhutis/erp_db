@@ -1,0 +1,2 @@
+id,name,description,status,can_delete,can_update
+019c0cd2-374b-795a-a028-460024d912b7,Super Admin,Vai trò khởi tạo từ hệ thống.,ACTIVE,false,false

@@ -38,13 +38,20 @@ CREATE TYPE movement_type  AS ENUM ('receipt','transfer','qc_release','issue','a
 -- 1. DANH MỤC (MASTER DATA)
 -- =============================================================================
 
--- Đơn vị tính: kg, g, thung, phuy, can, bao...
+-- Đơn vị tính: kg, g, lit, cai, thung, phuy, bao...
+--   dimension: nhóm đơn vị quy đổi được với nhau. MASS/VOLUME/COUNT/LENGTH có quy đổi
+--     TOÀN CỤC qua ratio_to_anchor (vd kg=1000, g=1 cùng MASS). PACK = đơn vị đóng gói
+--     (thùng/phuy/bao) — hệ số tuỳ ITEM, để ratio_to_anchor NULL, khai ở item_uom_conversion.
+CREATE TYPE uom_dimension AS ENUM ('MASS','VOLUME','COUNT','LENGTH','PACK');
+
 CREATE TABLE uom (
     id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    code            varchar(20)  NOT NULL UNIQUE,
-    name            varchar(100) NOT NULL,
-    is_base_weight  boolean      NOT NULL DEFAULT false,   -- true cho 'kg' (đơn vị gốc tính tồn & định mức)
-    created_at      timestamptz  NOT NULL DEFAULT now()
+    code            varchar(20)   NOT NULL UNIQUE,
+    name            varchar(100)  NOT NULL,
+    dimension       uom_dimension NOT NULL DEFAULT 'COUNT',
+    ratio_to_anchor numeric(18,6),                          -- giá trị theo 1 đơn vị mốc của dimension (PACK = NULL)
+    created_at      timestamptz   NOT NULL DEFAULT now(),
+    CHECK (dimension = 'PACK' OR ratio_to_anchor > 0)       -- đơn vị chuẩn bắt buộc có ratio dương
 );
 
 -- Nhà cung cấp
@@ -75,16 +82,47 @@ CREATE TABLE item (
 );
 CREATE INDEX idx_item_type ON item(item_type);
 
--- Quy đổi đơn vị danh nghĩa cho từng item: 1 thùng = 20 kg, 1 phuy = 200 kg...
--- (mỗi item có UOM riêng; khi nhập thực tế vẫn lưu cân thực ở phiếu nhập)
+-- Quy đổi đơn vị THEO TỪNG ITEM (dùng cho đơn vị PACK đóng gói item-specific):
+--   1 uom = factor_to_base × (đơn vị base của item). Vd Argan (base g): 1 thùng = 25000 g.
+--   (Đơn vị chuẩn cùng dimension như kg↔g quy đổi toàn cục qua uom.ratio_to_anchor — KHÔNG cần khai ở đây.)
 CREATE TABLE item_uom_conversion (
-    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    item_id     bigint NOT NULL REFERENCES item(id) ON DELETE CASCADE,
-    from_uom_id bigint NOT NULL REFERENCES uom(id),        -- vd: thung
-    to_uom_id   bigint NOT NULL REFERENCES uom(id),        -- vd: kg (base)
-    factor      numeric(18,6) NOT NULL CHECK (factor > 0), -- 1 from_uom = factor * to_uom
-    UNIQUE (item_id, from_uom_id, to_uom_id)
+    id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    item_id bigint        NOT NULL REFERENCES item(id) ON DELETE CASCADE,
+    uom_id  bigint        NOT NULL REFERENCES uom(id),         -- đơn vị thay thế (vd thùng)
+    factor_to_base numeric(18,6) NOT NULL CHECK (factor_to_base > 0), -- 1 uom = factor_to_base × base_uom
+    UNIQUE (item_id, uom_id)
 );
+
+-- fn_to_base: quy đổi (qty ở đơn vị p_uom) -> số lượng theo BASE uom của item.
+--   Ưu tiên: trùng base -> item-specific (item_uom_conversion) -> toàn cục cùng dimension -> lỗi.
+CREATE OR REPLACE FUNCTION fn_to_base(p_item_id bigint, p_qty numeric, p_uom_id bigint)
+    RETURNS numeric LANGUAGE plpgsql STABLE AS
+$$
+DECLARE
+    v_base   bigint;
+    v_factor numeric;
+    v_fdim   uom_dimension; v_fratio numeric;
+    v_bdim   uom_dimension; v_bratio numeric;
+BEGIN
+    IF p_qty IS NULL OR p_uom_id IS NULL OR p_item_id IS NULL THEN RETURN p_qty; END IF;
+    SELECT base_uom_id INTO v_base FROM item WHERE id = p_item_id;
+    IF p_uom_id = v_base THEN RETURN p_qty; END IF;
+
+    -- (1) quy đổi riêng của item (đơn vị đóng gói PACK)
+    SELECT factor_to_base INTO v_factor FROM item_uom_conversion
+    WHERE item_id = p_item_id AND uom_id = p_uom_id;
+    IF FOUND THEN RETURN p_qty * v_factor; END IF;
+
+    -- (2) quy đổi toàn cục: cùng dimension, qua ratio_to_anchor
+    SELECT dimension, ratio_to_anchor INTO v_fdim, v_fratio FROM uom WHERE id = p_uom_id;
+    SELECT dimension, ratio_to_anchor INTO v_bdim, v_bratio FROM uom WHERE id = v_base;
+    IF v_fdim = v_bdim AND v_fratio IS NOT NULL AND v_bratio IS NOT NULL THEN
+        RETURN p_qty * v_fratio / v_bratio;
+    END IF;
+
+    RAISE EXCEPTION 'Không có đường quy đổi từ uom % sang base của item %', p_uom_id, p_item_id;
+END;
+$$;
 
 -- -----------------------------------------------------------------------------
 -- 1b. KHO 3 CẤP: location -> warehouse_zone -> storage_bin
@@ -140,9 +178,10 @@ CREATE TABLE purchase_requisition_line (
     id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     pr_id   bigint        NOT NULL REFERENCES purchase_requisition(id) ON DELETE CASCADE,
     item_id bigint        NOT NULL REFERENCES item(id),
-    qty     numeric(18,4) NOT NULL CHECK (qty > 0),        -- theo base uom (kg)
-    uom_id  bigint        NOT NULL REFERENCES uom(id),
-    note    text
+    qty      numeric(18,4) NOT NULL CHECK (qty > 0),       -- ở đơn vị uom_id (đơn vị nhập)
+    uom_id   bigint        NOT NULL REFERENCES uom(id),
+    qty_base numeric(18,6),                                 -- = fn_to_base(item, qty, uom) — trigger tự điền
+    note     text
 );
 CREATE INDEX idx_prl_pr   ON purchase_requisition_line(pr_id);
 CREATE INDEX idx_prl_item ON purchase_requisition_line(item_id);
@@ -172,11 +211,12 @@ CREATE TABLE purchase_order_line (
     po_id         bigint        NOT NULL REFERENCES purchase_order(id) ON DELETE CASCADE,
     pr_line_id    bigint        REFERENCES purchase_requisition_line(id), -- truy nguồn về PR
     item_id       bigint        NOT NULL REFERENCES item(id),
-    ordered_qty   numeric(18,4) NOT NULL CHECK (ordered_qty > 0),         -- base uom (kg)
+    ordered_qty   numeric(18,4) NOT NULL CHECK (ordered_qty > 0),         -- ở đơn vị uom_id (vd kg)
     uom_id        bigint        NOT NULL REFERENCES uom(id),
-    unit_price    numeric(18,4) NOT NULL CHECK (unit_price >= 0),         -- giá thoả thuận
+    ordered_qty_base numeric(18,6),                                       -- quy về base item — trigger tự điền
+    unit_price    numeric(18,4) NOT NULL CHECK (unit_price >= 0),         -- giá THEO đơn vị uom_id (vd /kg)
     expected_date date,                                                   -- ngày giao (đợt) dự kiến
-    line_amount   numeric(18,2) GENERATED ALWAYS AS (ordered_qty * unit_price) STORED,
+    line_amount   numeric(18,2) GENERATED ALWAYS AS (ordered_qty * unit_price) STORED, -- tiền (đúng theo mọi đơn vị)
     note          text
 );
 CREATE INDEX idx_pol_po   ON purchase_order_line(po_id);
@@ -233,14 +273,16 @@ CREATE TABLE goods_receipt_line (
     package_qty    numeric(18,3),                          -- 100 thùng / 10 phuy
     package_uom_id bigint REFERENCES uom(id),              -- thùng / phuy
 
-    -- (b) CATCH WEIGHT — tách "khai báo" và "thực nhận"
-    declared_qty  numeric(18,4) NOT NULL CHECK (declared_qty >= 0), -- theo phiếu bên bán (kg) -> công nợ/hoá đơn
-    received_qty  numeric(18,4) NOT NULL CHECK (received_qty >= 0), -- cân thực (kg) -> ĐI VÀO TỒN KHO
-    qty_uom_id    bigint        NOT NULL REFERENCES uom(id),        -- kg (base)
+    -- (b) CATCH WEIGHT — tách "khai báo" và "thực nhận" (ở đơn vị qty_uom_id, vd thùng)
+    declared_qty  numeric(18,4) NOT NULL CHECK (declared_qty >= 0), -- theo phiếu bên bán -> công nợ/hoá đơn
+    received_qty  numeric(18,4) NOT NULL CHECK (received_qty >= 0), -- thực nhận -> ĐI VÀO TỒN KHO (qua base)
+    qty_uom_id    bigint        NOT NULL REFERENCES uom(id),        -- đơn vị nhập (vd thùng/kg)
+    declared_qty_base numeric(18,6),                                -- trigger tự điền (= fn_to_base)
+    received_qty_base numeric(18,6),                                -- trigger tự điền -> ledger ghi số NÀY
     weight_source weight_source NOT NULL DEFAULT 'declared',        -- cân toàn bộ / cân mẫu / theo phiếu
 
     -- (c) Giá & QC
-    unit_price    numeric(18,4) NOT NULL DEFAULT 0,        -- lấy từ PO line (giá vốn tạm tính)
+    unit_price    numeric(18,4) NOT NULL DEFAULT 0,        -- giá THEO đơn vị qty_uom_id (giá vốn tạm tính)
     qc_status     qc_status     NOT NULL DEFAULT 'quarantine',
     note          text
 );
@@ -311,14 +353,17 @@ CREATE INDEX idx_invmov_bin      ON inventory_movement(bin_id);
 -- =============================================================================
 
 -- 9.1 Tiến độ nhận theo từng dòng PO (tính động) -> biết đã nhận luỹ kế & còn lại.
+--   So khớp theo BASE uom (PO mua kg, GR nhận thùng... đều quy về base mới so được).
 CREATE VIEW v_po_line_progress AS
 SELECT
-    pol.id                                                    AS po_line_id,
+    pol.id                                                         AS po_line_id,
     pol.po_id,
     pol.item_id,
-    pol.ordered_qty,
-    COALESCE(SUM(grl.received_qty), 0)                        AS received_qty,
-    pol.ordered_qty - COALESCE(SUM(grl.received_qty), 0)      AS open_qty
+    pol.uom_id,                                                    -- đơn vị đặt mua (hiển thị)
+    pol.ordered_qty,                                               -- ở đơn vị uom_id
+    pol.ordered_qty_base,
+    COALESCE(SUM(grl.received_qty_base), 0)                        AS received_qty_base,
+    pol.ordered_qty_base - COALESCE(SUM(grl.received_qty_base), 0) AS open_qty   -- (base) -> MRP dùng số này
 FROM purchase_order_line pol
 LEFT JOIN goods_receipt_line grl ON grl.po_line_id = pol.id
 LEFT JOIN goods_receipt      gr  ON gr.id = grl.gr_id AND gr.status = 'posted'
@@ -411,8 +456,9 @@ CREATE TABLE bom (
     id             bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     item_id        bigint        NOT NULL REFERENCES item(id),   -- thành phẩm / bán thành phẩm công thức này tạo ra
     version        varchar(20)   NOT NULL DEFAULT 'v1',
-    output_qty     numeric(18,4) NOT NULL DEFAULT 1 CHECK (output_qty > 0), -- 1 mẻ công thức cho ra (base uom item)
+    output_qty     numeric(18,4) NOT NULL DEFAULT 1 CHECK (output_qty > 0), -- 1 mẻ công thức cho ra (ở output_uom_id)
     output_uom_id  bigint        NOT NULL REFERENCES uom(id),
+    output_qty_base numeric(18,6),                                          -- quy về base item — trigger tự điền
     status         bom_status    NOT NULL DEFAULT 'draft',
     effective_from date,
     effective_to   date,
@@ -429,8 +475,9 @@ CREATE TABLE bom_line (
     id                bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     bom_id            bigint        NOT NULL REFERENCES bom(id) ON DELETE CASCADE,
     component_item_id bigint        NOT NULL REFERENCES item(id),  -- NVL hoặc bán thành phẩm
-    qty               numeric(18,6) NOT NULL CHECK (qty > 0),      -- định mức cho output_qty của BOM (base uom component)
+    qty               numeric(18,6) NOT NULL CHECK (qty > 0),      -- định mức cho output_qty (ở đơn vị uom_id)
     uom_id            bigint        NOT NULL REFERENCES uom(id),
+    qty_base          numeric(18,6),                               -- quy về base component — trigger tự điền
     scrap_pct         numeric(7,4)  NOT NULL DEFAULT 0 CHECK (scrap_pct >= 0), -- % hao hụt
     note              text,
     UNIQUE (bom_id, component_item_id)
@@ -458,8 +505,9 @@ CREATE TABLE production_plan_line (
     id             bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     plan_id        bigint        NOT NULL REFERENCES production_plan(id) ON DELETE CASCADE,
     item_id        bigint        NOT NULL REFERENCES item(id),  -- thành phẩm cần SX
-    planned_qty    numeric(18,4) NOT NULL CHECK (planned_qty > 0),
+    planned_qty    numeric(18,4) NOT NULL CHECK (planned_qty > 0), -- ở đơn vị uom_id
     uom_id         bigint        NOT NULL REFERENCES uom(id),
+    planned_qty_base numeric(18,6),                             -- quy về base — trigger tự điền (MRP dùng số này)
     needed_by_date date,
     note           text
 );
@@ -475,8 +523,9 @@ CREATE TABLE production_order (
     item_id         bigint                  NOT NULL REFERENCES item(id),  -- thành phẩm/bán thành phẩm SX
     bom_id          bigint                  REFERENCES bom(id),            -- công thức áp dụng
     plan_line_id    bigint                  REFERENCES production_plan_line(id), -- truy nguồn về kế hoạch
-    planned_qty     numeric(18,4)           NOT NULL CHECK (planned_qty > 0),
+    planned_qty     numeric(18,4)           NOT NULL CHECK (planned_qty > 0), -- ở đơn vị uom_id
     uom_id          bigint                  NOT NULL REFERENCES uom(id),
+    planned_qty_base numeric(18,6),                                         -- quy về base — trigger tự điền
     location_id     bigint                  REFERENCES location(id),       -- nơi SX / nhập thành phẩm
     scheduled_start date,
     scheduled_end   date,
@@ -495,8 +544,9 @@ CREATE TABLE production_order_material (
     id                bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     mo_id             bigint        NOT NULL REFERENCES production_order(id) ON DELETE CASCADE,
     component_item_id bigint        NOT NULL REFERENCES item(id),
-    required_qty      numeric(18,6) NOT NULL CHECK (required_qty >= 0),   -- gồm scrap
+    required_qty      numeric(18,6) NOT NULL CHECK (required_qty >= 0),   -- gồm scrap (ở đơn vị uom_id)
     uom_id            bigint        NOT NULL REFERENCES uom(id),
+    required_qty_base numeric(18,6),                                      -- quy về base — trigger tự điền
     note              text,
     UNIQUE (mo_id, component_item_id)
 );
@@ -515,7 +565,7 @@ CREATE VIEW v_mrp_gross_requirement AS
 WITH RECURSIVE explosion AS (
     SELECT ppl.plan_id,
            ppl.item_id           AS component_item_id,
-           ppl.planned_qty::numeric AS req_qty,   -- ép numeric không ràng buộc để khớp kiểu nhánh đệ quy
+           ppl.planned_qty_base::numeric AS req_qty,   -- dùng BASE; ép numeric để khớp kiểu nhánh đệ quy
            ARRAY[ppl.item_id]    AS path,
            1                     AS lvl
     FROM production_plan_line ppl
@@ -525,7 +575,7 @@ WITH RECURSIVE explosion AS (
 
     SELECT e.plan_id,
            bl.component_item_id,
-           e.req_qty * bl.qty / b.output_qty * (1 + bl.scrap_pct / 100.0),
+           e.req_qty * bl.qty_base / b.output_qty_base * (1 + bl.scrap_pct / 100.0),
            e.path || bl.component_item_id,
            e.lvl + 1
     FROM explosion e
@@ -627,8 +677,9 @@ CREATE TABLE material_issue_line (
     component_item_id bigint        NOT NULL REFERENCES item(id),
     lot_id            bigint        REFERENCES lot(id),          -- lô NVL/SF bị tiêu hao (chọn FEFO)
     from_bin_id       bigint        NOT NULL REFERENCES storage_bin(id), -- bin Bảo quản xuất ra
-    qty               numeric(18,4) NOT NULL CHECK (qty > 0),   -- base uom (kg) -> ledger ghi ÂM
+    qty               numeric(18,4) NOT NULL CHECK (qty > 0),   -- ở đơn vị uom_id
     uom_id            bigint        NOT NULL REFERENCES uom(id),
+    qty_base          numeric(18,6),                            -- quy về base -> ledger ghi ÂM số này — trigger tự điền
     note              text
 );
 CREATE INDEX idx_mil_issue ON material_issue_line(issue_id);
@@ -640,12 +691,12 @@ CREATE VIEW v_mo_material_status AS
 SELECT
     mom.mo_id,
     mom.component_item_id,
-    mom.required_qty,
-    COALESCE(iss.issued_qty, 0)                  AS issued_qty,
-    mom.required_qty - COALESCE(iss.issued_qty, 0) AS open_qty
+    mom.required_qty_base,
+    COALESCE(iss.issued_qty_base, 0)                       AS issued_qty_base,
+    mom.required_qty_base - COALESCE(iss.issued_qty_base, 0) AS open_qty_base   -- (base)
 FROM production_order_material mom
 LEFT JOIN (
-    SELECT mi.mo_id, mil.component_item_id, SUM(mil.qty) AS issued_qty
+    SELECT mi.mo_id, mil.component_item_id, SUM(mil.qty_base) AS issued_qty_base
     FROM material_issue mi
     JOIN material_issue_line mil ON mil.issue_id = mi.id
     WHERE mi.status = 'posted'
@@ -697,8 +748,9 @@ CREATE TABLE production_receipt_line (
     receipt_id   bigint        NOT NULL REFERENCES production_receipt(id) ON DELETE CASCADE,
     lot_id       bigint        NOT NULL REFERENCES lot(id),  -- LÔ FG MỚI (item nội bộ)
     to_bin_id    bigint        NOT NULL REFERENCES storage_bin(id), -- requires_qc: TEMPORARY; else PRESERVATION
-    produced_qty numeric(18,4) NOT NULL CHECK (produced_qty > 0),   -- base uom -> ledger ghi DƯƠNG
+    produced_qty numeric(18,4) NOT NULL CHECK (produced_qty > 0),   -- ở đơn vị uom_id
     uom_id       bigint        NOT NULL REFERENCES uom(id),
+    produced_qty_base numeric(18,6),                                -- quy về base -> ledger ghi DƯƠNG số này — trigger tự điền
     note         text
 );
 CREATE INDEX idx_prcptl_receipt ON production_receipt_line(receipt_id);
@@ -717,12 +769,12 @@ SELECT
     mo.id        AS mo_id,
     mo.mo_no,
     mo.item_id,
-    mo.planned_qty,
-    COALESCE(rc.produced_qty, 0)                  AS produced_qty,
-    mo.planned_qty - COALESCE(rc.produced_qty, 0) AS remaining_qty
+    mo.planned_qty_base,
+    COALESCE(rc.produced_qty_base, 0)                       AS produced_qty_base,
+    mo.planned_qty_base - COALESCE(rc.produced_qty_base, 0) AS remaining_qty_base
 FROM production_order mo
 LEFT JOIN (
-    SELECT pr.mo_id, SUM(prl.produced_qty) AS produced_qty
+    SELECT pr.mo_id, SUM(prl.produced_qty_base) AS produced_qty_base
     FROM production_receipt pr
     JOIN production_receipt_line prl ON prl.receipt_id = pr.id
     WHERE pr.status = 'posted'
@@ -826,7 +878,7 @@ BEGIN
         gross   numeric(18,6) NOT NULL DEFAULT 0
     ) ON COMMIT DROP;
     INSERT INTO _req(item_id, gross)
-    SELECT item_id, SUM(planned_qty)
+    SELECT item_id, SUM(planned_qty_base)   -- nhu cầu khởi tạo ở BASE uom của thành phẩm
     FROM production_plan_line
     WHERE plan_id = p_plan_id
     GROUP BY item_id;
@@ -866,7 +918,7 @@ BEGIN
         -- nổ net>0 của item CÓ active BOM xuống component (cộng dồn gross cấp dưới).
         INSERT INTO _req(item_id, gross)
         SELECT bl.component_item_id,
-               SUM(n.net * bl.qty / b.output_qty * (1 + bl.scrap_pct / 100.0))
+               SUM(n.net * bl.qty_base / b.output_qty_base * (1 + bl.scrap_pct / 100.0))
         FROM netted n
         JOIN bom      b  ON b.item_id = n.item_id AND b.status = 'active'
         JOIN bom_line bl ON bl.bom_id = b.id
@@ -926,11 +978,13 @@ BEGIN
     ),
     ins_mat AS (   -- định mức NVL 1 cấp của MO (gồm scrap) -> để xuất kho theo lệnh
         INSERT INTO production_order_material(mo_id, component_item_id, required_qty, uom_id)
-        SELECT im.mo_id, bl.component_item_id,
-               im.planned_qty * bl.qty / b.output_qty * (1 + bl.scrap_pct / 100.0), bl.uom_id
+        SELECT im.mo_id, bl.component_item_id,                          -- im.planned_qty đã ở base (= net MRP)
+               im.planned_qty * bl.qty_base / b.output_qty_base * (1 + bl.scrap_pct / 100.0),
+               ci.base_uom_id                                          -- định mức ở BASE của component
         FROM ins_mo im
         JOIN bom      b  ON b.id = im.bom_id
         JOIN bom_line bl ON bl.bom_id = b.id
+        JOIN item     ci ON ci.id = bl.component_item_id
         RETURNING 1
     )
     SELECT count(*) INTO v_count FROM ins_mo;   -- các CTE sửa-dữ-liệu vẫn chạy hết
@@ -944,15 +998,15 @@ $$;
 --   (bảo toàn khối lượng: Σ alloc_qty theo con = consumed_qty của cha). Cơ sở chia chi phí.
 -- =============================================================================
 CREATE VIEW v_lot_genealogy_alloc AS
-WITH mo_consume AS (   -- (mo, lô cha): tổng tiêu hao
-    SELECT mi.mo_id, mil.lot_id AS parent_lot_id, SUM(mil.qty) AS consumed_qty
+WITH mo_consume AS (   -- (mo, lô cha): tổng tiêu hao (BASE)
+    SELECT mi.mo_id, mil.lot_id AS parent_lot_id, SUM(mil.qty_base) AS consumed_qty
     FROM material_issue mi
     JOIN material_issue_line mil ON mil.issue_id = mi.id AND mil.lot_id IS NOT NULL
     WHERE mi.status = 'posted'
     GROUP BY mi.mo_id, mil.lot_id
 ),
-mo_produce AS (        -- (mo, lô con): sản lượng
-    SELECT pr.mo_id, prl.lot_id AS child_lot_id, SUM(prl.produced_qty) AS produced_qty
+mo_produce AS (        -- (mo, lô con): sản lượng (BASE)
+    SELECT pr.mo_id, prl.lot_id AS child_lot_id, SUM(prl.produced_qty_base) AS produced_qty
     FROM production_receipt pr
     JOIN production_receipt_line prl ON prl.receipt_id = pr.id
     WHERE pr.status = 'posted'
@@ -986,19 +1040,19 @@ BEGIN
     DROP TABLE IF EXISTS _lc;   -- an toàn nếu gọi lại trong cùng transaction
     CREATE TEMP TABLE _lc(lot_id bigint PRIMARY KEY, unit_cost numeric(18,6)) ON COMMIT DROP;
 
-    -- 1. lô MUA: bình quân gia quyền theo giá GR
+    -- 1. lô MUA: giá vốn / ĐƠN VỊ BASE = Σ(tiền) / Σ(số lượng base). (unit_price theo đơn vị nhập)
     INSERT INTO _lc(lot_id, unit_cost)
-    SELECT grl.lot_id, SUM(grl.received_qty * grl.unit_price) / SUM(grl.received_qty)
+    SELECT grl.lot_id, SUM(grl.received_qty * grl.unit_price) / SUM(grl.received_qty_base)
     FROM goods_receipt_line grl
     WHERE grl.lot_id IS NOT NULL
     GROUP BY grl.lot_id
-    HAVING SUM(grl.received_qty) > 0;
+    HAVING SUM(grl.received_qty_base) > 0;
 
     -- 2. lô SX: cuộn từ dưới lên (lô con costable khi MỌI lô input đã có giá)
     LOOP
         v_pass := v_pass + 1;
         WITH mo_in AS (
-            SELECT mi.mo_id, SUM(mil.qty * lc.unit_cost) AS input_cost,
+            SELECT mi.mo_id, SUM(mil.qty_base * lc.unit_cost) AS input_cost,
                    bool_and(lc.unit_cost IS NOT NULL) AS ready
             FROM material_issue mi
             JOIN material_issue_line mil ON mil.issue_id = mi.id AND mil.lot_id IS NOT NULL
@@ -1007,7 +1061,7 @@ BEGIN
             GROUP BY mi.mo_id
         ),
         mo_out AS (
-            SELECT pr.mo_id, SUM(prl.produced_qty) AS out_qty
+            SELECT pr.mo_id, SUM(prl.produced_qty_base) AS out_qty
             FROM production_receipt pr
             JOIN production_receipt_line prl ON prl.receipt_id = pr.id
             WHERE pr.status = 'posted'
@@ -1052,7 +1106,7 @@ SELECT mo.id AS mo_id, mo.mo_no, mo.item_id,
        inp.input_cost / NULLIF(outp.out_qty, 0) AS unit_cost
 FROM production_order mo
 LEFT JOIN (
-    SELECT mi.mo_id, SUM(mil.qty * il.unit_cost) AS input_cost
+    SELECT mi.mo_id, SUM(mil.qty_base * il.unit_cost) AS input_cost
     FROM material_issue mi
     JOIN material_issue_line mil ON mil.issue_id = mi.id AND mil.lot_id IS NOT NULL
     JOIN lot il ON il.id = mil.lot_id
@@ -1060,7 +1114,7 @@ LEFT JOIN (
     GROUP BY mi.mo_id
 ) inp ON inp.mo_id = mo.id
 LEFT JOIN (
-    SELECT pr.mo_id, SUM(prl.produced_qty) AS out_qty
+    SELECT pr.mo_id, SUM(prl.produced_qty_base) AS out_qty
     FROM production_receipt pr
     JOIN production_receipt_line prl ON prl.receipt_id = pr.id
     WHERE pr.status = 'posted'
@@ -1136,6 +1190,102 @@ $$
             END LOOP;
     END;
 $$;
+
+-- =============================================================================
+-- 11. QUY ĐỔI ĐƠN VỊ — trigger BEFORE tự điền cột *_base = fn_to_base(item, qty, uom)
+--   Mọi dòng chứng từ giữ (qty, uom) như nhập; cột *_base (đơn vị gốc item) do trigger
+--   tính, và MỌI view/hàm tính toán dùng *_base. Đặt sau khi mọi bảng đã tồn tại.
+-- =============================================================================
+
+-- 11.1 Trigger GENERIC (TG_ARGV = item_col, qty_col, uom_col, base_col) — bảng KHÔNG có cột generated.
+CREATE OR REPLACE FUNCTION fn_fill_qty_base() RETURNS trigger LANGUAGE plpgsql AS
+$$
+DECLARE
+    j      jsonb := to_jsonb(NEW);
+    v_item bigint := (j ->> TG_ARGV[0])::bigint;
+    v_qty  numeric := (j ->> TG_ARGV[1])::numeric;
+    v_uom  bigint := (j ->> TG_ARGV[2])::bigint;
+BEGIN
+    IF v_item IS NULL OR v_qty IS NULL OR v_uom IS NULL THEN RETURN NEW; END IF;
+    NEW := jsonb_populate_record(NEW, jsonb_build_object(TG_ARGV[3], fn_to_base(v_item, v_qty, v_uom)));
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_qtybase BEFORE INSERT OR UPDATE ON bom
+    FOR EACH ROW EXECUTE FUNCTION fn_fill_qty_base('item_id','output_qty','output_uom_id','output_qty_base');
+CREATE TRIGGER trg_qtybase BEFORE INSERT OR UPDATE ON bom_line
+    FOR EACH ROW EXECUTE FUNCTION fn_fill_qty_base('component_item_id','qty','uom_id','qty_base');
+CREATE TRIGGER trg_qtybase BEFORE INSERT OR UPDATE ON production_plan_line
+    FOR EACH ROW EXECUTE FUNCTION fn_fill_qty_base('item_id','planned_qty','uom_id','planned_qty_base');
+CREATE TRIGGER trg_qtybase BEFORE INSERT OR UPDATE ON production_order
+    FOR EACH ROW EXECUTE FUNCTION fn_fill_qty_base('item_id','planned_qty','uom_id','planned_qty_base');
+CREATE TRIGGER trg_qtybase BEFORE INSERT OR UPDATE ON production_order_material
+    FOR EACH ROW EXECUTE FUNCTION fn_fill_qty_base('component_item_id','required_qty','uom_id','required_qty_base');
+CREATE TRIGGER trg_qtybase BEFORE INSERT OR UPDATE ON purchase_requisition_line
+    FOR EACH ROW EXECUTE FUNCTION fn_fill_qty_base('item_id','qty','uom_id','qty_base');
+CREATE TRIGGER trg_qtybase BEFORE INSERT OR UPDATE ON material_issue_line
+    FOR EACH ROW EXECUTE FUNCTION fn_fill_qty_base('component_item_id','qty','uom_id','qty_base');
+
+-- 11.2 purchase_order_line — có cột generated line_amount -> dùng trigger riêng (gán trực tiếp).
+CREATE OR REPLACE FUNCTION fn_fill_pol_base() RETURNS trigger LANGUAGE plpgsql AS
+$$
+BEGIN
+    IF NEW.item_id IS NOT NULL AND NEW.ordered_qty IS NOT NULL AND NEW.uom_id IS NOT NULL THEN
+        NEW.ordered_qty_base := fn_to_base(NEW.item_id, NEW.ordered_qty, NEW.uom_id);
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER trg_qtybase BEFORE INSERT OR UPDATE ON purchase_order_line
+    FOR EACH ROW EXECUTE FUNCTION fn_fill_pol_base();
+
+-- 11.3 goods_receipt_line — 2 cột base (declared & received), cùng qty_uom_id.
+CREATE OR REPLACE FUNCTION fn_fill_grl_base() RETURNS trigger LANGUAGE plpgsql AS
+$$
+BEGIN
+    IF NEW.item_id IS NOT NULL AND NEW.qty_uom_id IS NOT NULL THEN
+        NEW.received_qty_base := fn_to_base(NEW.item_id, NEW.received_qty, NEW.qty_uom_id);
+        NEW.declared_qty_base := fn_to_base(NEW.item_id, NEW.declared_qty, NEW.qty_uom_id);
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER trg_qtybase BEFORE INSERT OR UPDATE ON goods_receipt_line
+    FOR EACH ROW EXECUTE FUNCTION fn_fill_grl_base();
+
+-- 11.4 production_receipt_line — KHÔNG có item_id (lấy qua lot).
+CREATE OR REPLACE FUNCTION fn_fill_prl_base() RETURNS trigger LANGUAGE plpgsql AS
+$$
+DECLARE v_item bigint;
+BEGIN
+    IF NEW.produced_qty IS NOT NULL AND NEW.uom_id IS NOT NULL AND NEW.lot_id IS NOT NULL THEN
+        SELECT item_id INTO v_item FROM lot WHERE id = NEW.lot_id;
+        NEW.produced_qty_base := fn_to_base(v_item, NEW.produced_qty, NEW.uom_id);
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER trg_qtybase BEFORE INSERT OR UPDATE ON production_receipt_line
+    FOR EACH ROW EXECUTE FUNCTION fn_fill_prl_base();
+
+-- 11.5 Đơn vị HỢP LỆ để nhập trên chứng từ cho mỗi item (nguồn cho UI dropdown).
+--   Chính sách HẸP (allow-list): chỉ base_uom + đơn vị KHAI TƯỜNG MINH ở item_uom_conversion.
+--   Khớp đúng nhánh (0)+(1) của fn_to_base, BỎ nhánh (2) toàn cục: đơn vị cùng dimension (kg↔g) tuy
+--   fn_to_base tự quy đổi được vẫn phải khai để hiện trong list -> kiểm soát chặt, danh sách sạch.
+--   factor_to_base = 1 đơn vị này bằng bao nhiêu base_uom (tiện hiển thị "1 thùng = 400 cái").
+CREATE VIEW v_item_valid_uom AS
+SELECT i.id AS item_id, i.base_uom_id AS uom_id, u.code, u.name,
+       'base'::text AS source, 1::numeric(18,6) AS factor_to_base
+FROM item i
+JOIN uom u ON u.id = i.base_uom_id
+UNION ALL
+SELECT c.item_id, c.uom_id, u.code, u.name,
+       'item-specific'::text, c.factor_to_base
+FROM item_uom_conversion c
+JOIN uom u  ON u.id = c.uom_id
+JOIN item i ON i.id = c.item_id
+WHERE c.uom_id <> i.base_uom_id;     -- tránh trùng dòng base nếu lỡ khai base vào conversion
 
 -- =============================================================================
 -- TRẠNG THÁI & GIỚI HẠN ĐÃ BIẾT

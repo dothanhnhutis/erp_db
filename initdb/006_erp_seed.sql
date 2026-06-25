@@ -15,12 +15,14 @@
 -- -----------------------------------------------------------------------------
 -- 1. ĐƠN VỊ TÍNH (UOM) — kg là đơn vị GỐC tính tồn/định mức (is_base_weight)
 -- -----------------------------------------------------------------------------
-INSERT INTO uom (code, name, is_base_weight) VALUES
-    ('kg',    'Kilogram',  true),    -- đơn vị gốc cho NVL & bán thành phẩm (bulk)
-    ('g',     'Gram',      false),
-    ('lit',   'Lít',       false),
-    ('cai',   'Cái/Chiếc', false),   -- đơn vị cho bao bì & thành phẩm
-    ('thung', 'Thùng',     false);   -- đơn vị đóng gói lớn (quy đổi sang kg/cái)
+-- dimension + ratio_to_anchor: đơn vị cùng dimension quy đổi TOÀN CỤC (kg=1000g, lit=1000ml).
+-- thung = PACK (đóng gói theo-item) -> ratio NULL, khai hệ số ở item_uom_conversion bên dưới.
+INSERT INTO uom (code, name, dimension, ratio_to_anchor) VALUES
+    ('kg',    'Kilogram',  'MASS',   1000),   -- 1 kg = 1000 (mốc g)
+    ('g',     'Gram',      'MASS',   1),
+    ('lit',   'Lít',       'VOLUME', 1000),   -- 1 lít = 1000 (mốc ml)
+    ('cai',   'Cái/Chiếc', 'COUNT',  1),      -- đơn vị cho bao bì & thành phẩm
+    ('thung', 'Thùng',     'PACK',   NULL);   -- đóng gói: hệ số tuỳ item
 
 -- -----------------------------------------------------------------------------
 -- 2. NHÀ CUNG CẤP
@@ -37,7 +39,7 @@ INSERT INTO supplier (code, name, tax_code, payment_terms, prepay_required, phon
 -- 3a. Nguyên liệu (RAW_MATERIAL) — lưu kg, bắt buộc QC
 INSERT INTO item (code, name, item_type, base_uom_id, requires_qc, shelf_life_days) VALUES
     ('RM-WATER',    'Nước tinh khiết',              'RAW_MATERIAL', (SELECT id FROM uom WHERE code='kg'), true,  365),
-    ('RM-GLYCERIN', 'Glycerin',                     'RAW_MATERIAL', (SELECT id FROM uom WHERE code='kg'), true,  730),
+    ('RM-GLYCERIN', 'Glycerin',                     'RAW_MATERIAL', (SELECT id FROM uom WHERE code='g'),  true,  730), -- base = GRAM (minh hoạ đa đơn vị)
     ('RM-ARGAN',    'Dầu Argan',                    'RAW_MATERIAL', (SELECT id FROM uom WHERE code='kg'), true,  540),
     ('RM-ALOE',     'Chiết xuất Lô hội',            'RAW_MATERIAL', (SELECT id FROM uom WHERE code='kg'), true,  365),
     ('RM-PRESV',    'Chất bảo quản Phenoxyethanol', 'RAW_MATERIAL', (SELECT id FROM uom WHERE code='kg'), true,  1095),
@@ -67,12 +69,20 @@ INSERT INTO item (code, name, item_type, base_uom_id, requires_qc, shelf_life_da
     ('FG-WASH100',  'Sữa rửa mặt 100ml', 'FINISHED_GOOD', (SELECT id FROM uom WHERE code='cai'), true, 730);
 
 -- -----------------------------------------------------------------------------
--- 4. QUY ĐỔI ĐƠN VỊ (minh hoạ "mỗi item có UOM riêng")
---    1 thùng dầu Argan = 25 kg; 1 thùng chai 50ml = 100 cái
+-- 4. QUY ĐỔI ĐƠN VỊ THEO ITEM — 1 uom = factor_to_base × base_uom. Dùng cho 3 nhu cầu:
+--    (a) đơn vị PACK đóng gói: Argan (base kg) 1 thùng = 25 kg; Glycerin (base g) 1 thùng = 20000 g;
+--        Chai 50ml (base cái) 1 thùng = 100 cái.
+--    (b) BẮC CẦU KHÁC DIMENSION qua tỷ trọng: Cồn (base kg) 1 lít = 0.785 kg (= 15.7 kg / 20 lít) —
+--        lít↔kg KHÔNG quy đổi toàn cục được (khác dimension) nên BẮT BUỘC khai ở đây.
+--    (c) khai TƯỜNG MINH đơn vị cùng dimension cho allow-list v_item_valid_uom: Glycerin (base g)
+--        1 kg = 1000 g — để dropdown hiện 'kg' (dù kg↔g vốn tự quy đổi toàn cục qua ratio_to_anchor).
 -- -----------------------------------------------------------------------------
-INSERT INTO item_uom_conversion (item_id, from_uom_id, to_uom_id, factor) VALUES
-    ((SELECT id FROM item WHERE code='RM-ARGAN'),    (SELECT id FROM uom WHERE code='thung'), (SELECT id FROM uom WHERE code='kg'),  25),
-    ((SELECT id FROM item WHERE code='PK-BOTTLE50'), (SELECT id FROM uom WHERE code='thung'), (SELECT id FROM uom WHERE code='cai'), 100);
+INSERT INTO item_uom_conversion (item_id, uom_id, factor_to_base) VALUES
+    ((SELECT id FROM item WHERE code='RM-ARGAN'),    (SELECT id FROM uom WHERE code='thung'), 25),
+    ((SELECT id FROM item WHERE code='RM-GLYCERIN'), (SELECT id FROM uom WHERE code='thung'), 20000),  -- (a) base g, PACK
+    ((SELECT id FROM item WHERE code='PK-BOTTLE50'), (SELECT id FROM uom WHERE code='thung'), 100),
+    ((SELECT id FROM item WHERE code='SOL-ETHANOL'), (SELECT id FROM uom WHERE code='lit'),   0.785), -- (b) base kg, mua theo lít (tỷ trọng)
+    ((SELECT id FROM item WHERE code='RM-GLYCERIN'), (SELECT id FROM uom WHERE code='kg'),    1000);  -- (c) base g, hiện kg trong allow-list
 
 -- -----------------------------------------------------------------------------
 -- 5. KHO 3 CẤP: location -> warehouse_zone -> storage_bin

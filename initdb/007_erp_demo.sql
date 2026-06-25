@@ -25,6 +25,9 @@ DECLARE
     v_po_pack  bigint;
     v_gr_chem  bigint;
     v_gr_pack  bigint;
+    v_po_gly   bigint;   -- PO riêng cho glycerin (minh hoạ mua kg)
+    v_gr_gly   bigint;   -- GR riêng cho glycerin (minh hoạ nhận thùng)
+    v_lot_gly  bigint;
     v_mo_sf    bigint;
     v_mo_fg    bigint;
     v_mi       bigint;
@@ -52,9 +55,9 @@ BEGIN
     -- Đơn giá mua (giá vốn nhập) + Số lượng mua (làm tròn LÊN so với nhu cầu = tồn an toàn).
     CREATE TEMP TABLE _buy ON COMMIT DROP AS
     SELECT i.id AS item_id, d.price::numeric AS price, d.qty::numeric AS qty
+    -- (RM-GLYCERIN xử lý RIÊNG bên dưới: base=g, mua kg, nhận thùng — minh hoạ đa đơn vị.)
     FROM item i JOIN (VALUES
         ('RM-WATER',     2,   40),   -- cần 35  -> mua 40
-        ('RM-GLYCERIN',  40,  10),   -- cần 7.5 -> mua 10
         ('RM-ARGAN',     500, 5),    -- cần 4.2 -> mua 5
         ('RM-ALOE',      120, 3),    -- cần 2.5 -> mua 3
         ('RM-PRESV',     300, 2),    -- cần 1.0 -> mua 2
@@ -146,9 +149,9 @@ BEGIN
     JOIN _bin bn ON bn.item_id = pol.item_id
     WHERE pol.po_id IN (v_po_chem, v_po_pack);
 
-    -- 5e. Ledger NHẬP (+) vào bin của dòng nhập (TT cho NVL, BQ cho bao bì).
+    -- 5e. Ledger NHẬP (+) vào bin của dòng nhập (ghi theo BASE: received_qty_base).
     INSERT INTO inventory_movement(movement_type, item_id, bin_id, lot_id, qty, unit_cost, source_type, source_id)
-    SELECT 'receipt', grl.item_id, grl.to_bin_id, grl.lot_id, grl.received_qty, grl.unit_price, 'goods_receipt', grl.id
+    SELECT 'receipt', grl.item_id, grl.to_bin_id, grl.lot_id, grl.received_qty_base, grl.unit_price, 'goods_receipt', grl.id
     FROM goods_receipt_line grl WHERE grl.gr_id IN (v_gr_chem, v_gr_pack);
 
     -- 5f. QC NHẬP đạt cho NVL (requires_qc): ghi qc_inspection -> lô approved -> chuyển TT sang BQ.
@@ -162,14 +165,52 @@ BEGIN
                  WHERE grl.gr_id IN (v_gr_chem, v_gr_pack) AND i.requires_qc);
 
     INSERT INTO inventory_movement(movement_type, item_id, bin_id, lot_id, qty, unit_cost, source_type, source_id)
-    SELECT 'transfer', grl.item_id, grl.to_bin_id, grl.lot_id, -grl.received_qty, grl.unit_price, 'qc_release', grl.id
+    SELECT 'transfer', grl.item_id, grl.to_bin_id, grl.lot_id, -grl.received_qty_base, grl.unit_price, 'qc_release', grl.id
     FROM goods_receipt_line grl JOIN item i ON i.id=grl.item_id
     WHERE grl.gr_id IN (v_gr_chem, v_gr_pack) AND i.requires_qc;
     INSERT INTO inventory_movement(movement_type, item_id, bin_id, lot_id, qty, unit_cost, source_type, source_id)
-    SELECT 'qc_release', grl.item_id, bn.bq_bin, grl.lot_id, grl.received_qty, grl.unit_price, 'qc_release', grl.id
+    SELECT 'qc_release', grl.item_id, bn.bq_bin, grl.lot_id, grl.received_qty_base, grl.unit_price, 'qc_release', grl.id
     FROM goods_receipt_line grl JOIN item i ON i.id=grl.item_id JOIN _bin bn ON bn.item_id=grl.item_id
     WHERE grl.gr_id IN (v_gr_chem, v_gr_pack) AND i.requires_qc;
     RAISE NOTICE 'Bước 5: Nhập kho 2 PO, QC đạt, nguyên liệu & bao bì đã vào bin Bảo quản (khả dụng).';
+
+    -- 5g. GLYCERIN — MINH HOẠ ĐA ĐƠN VỊ: base = GRAM, ĐẶT MUA bằng KG, NHẬN bằng THÙNG.
+    --     PO 20 kg @ 40/kg ; GR 1 thùng @ 800/thùng (1 thùng = 20000 g). fn_to_base tự quy:
+    --     ordered_qty_base = 20×1000 = 20000 g (toàn cục kg→g); received_qty_base = 1×20000 = 20000 g (item PACK).
+    INSERT INTO purchase_order(po_no, supplier_id, status, created_by)
+    VALUES ('PO-CHEM-GLY', (SELECT id FROM supplier WHERE code='SUP-CHEM'), 'confirmed', v_admin) RETURNING id INTO v_po_gly;
+    INSERT INTO purchase_order_line(po_id, pr_line_id, item_id, ordered_qty, uom_id, unit_price)
+    VALUES (v_po_gly,
+            (SELECT id FROM purchase_requisition_line WHERE pr_id=v_pr AND item_id=(SELECT id FROM item WHERE code='RM-GLYCERIN')),
+            (SELECT id FROM item WHERE code='RM-GLYCERIN'), 20, v_kg, 40);   -- MUA 20 KG @ 40/kg
+    INSERT INTO lot(lot_no, item_id, supplier_id, qc_status, manufacture_date)
+    VALUES ('L-RM-GLYCERIN', (SELECT id FROM item WHERE code='RM-GLYCERIN'),
+            (SELECT id FROM supplier WHERE code='SUP-CHEM'), 'quarantine', current_date) RETURNING id INTO v_lot_gly;
+    INSERT INTO goods_receipt(gr_no, po_id, supplier_id, location_id, received_by, status)
+    VALUES ('GR-GLY-01', v_po_gly, (SELECT id FROM supplier WHERE code='SUP-CHEM'), v_loc, v_admin, 'posted') RETURNING id INTO v_gr_gly;
+    INSERT INTO goods_receipt_line(gr_id, po_line_id, item_id, lot_id, to_bin_id,
+                                   declared_qty, received_qty, qty_uom_id, unit_price, qc_status)
+    VALUES (v_gr_gly, (SELECT id FROM purchase_order_line WHERE po_id=v_po_gly),
+            (SELECT id FROM item WHERE code='RM-GLYCERIN'), v_lot_gly,
+            (SELECT tt_bin FROM _bin WHERE item_id=(SELECT id FROM item WHERE code='RM-GLYCERIN')),
+            1, 1, (SELECT id FROM uom WHERE code='thung'), 800, 'quarantine');  -- NHẬN 1 THÙNG @ 800/thùng
+    -- ledger nhập (BASE g) + QC đạt + chuyển TT->BQ ; unit_cost quy về /g = price*qty/qty_base
+    INSERT INTO inventory_movement(movement_type, item_id, bin_id, lot_id, qty, unit_cost, source_type, source_id)
+    SELECT 'receipt', grl.item_id, grl.to_bin_id, grl.lot_id, grl.received_qty_base,
+           grl.unit_price*grl.received_qty/NULLIF(grl.received_qty_base,0), 'goods_receipt', grl.id
+    FROM goods_receipt_line grl WHERE grl.gr_id = v_gr_gly;
+    INSERT INTO qc_inspection(gr_line_id, lot_id, inspected_by, result, note)
+    SELECT grl.id, grl.lot_id, v_admin, 'approved', 'IQC đạt' FROM goods_receipt_line grl WHERE grl.gr_id = v_gr_gly;
+    UPDATE lot SET qc_status='approved' WHERE id = v_lot_gly;
+    INSERT INTO inventory_movement(movement_type, item_id, bin_id, lot_id, qty, unit_cost, source_type, source_id)
+    SELECT 'transfer', grl.item_id, grl.to_bin_id, grl.lot_id, -grl.received_qty_base,
+           grl.unit_price*grl.received_qty/NULLIF(grl.received_qty_base,0), 'qc_release', grl.id
+    FROM goods_receipt_line grl WHERE grl.gr_id = v_gr_gly;
+    INSERT INTO inventory_movement(movement_type, item_id, bin_id, lot_id, qty, unit_cost, source_type, source_id)
+    SELECT 'qc_release', grl.item_id, bn.bq_bin, grl.lot_id, grl.received_qty_base,
+           grl.unit_price*grl.received_qty/NULLIF(grl.received_qty_base,0), 'qc_release', grl.id
+    FROM goods_receipt_line grl JOIN _bin bn ON bn.item_id=grl.item_id WHERE grl.gr_id = v_gr_gly;
+    RAISE NOTICE 'Bước 5b: Glycerin base=g — đặt 20 kg, nhận 1 thùng -> tồn 20000 g (tiêu hao 7500 g khi SX bulk).';
 
     -- ===== BƯỚC 6: SẢN XUẤT BULK (lệnh MO SF-CREAM) =====
     -- 6a. Xuất NVL theo định mức của lệnh (production_order_material) từ bin Bảo quản.
@@ -184,7 +225,7 @@ BEGIN
     JOIN _bin bn ON bn.item_id = mom.component_item_id
     WHERE mom.mo_id = v_mo_sf;
     INSERT INTO inventory_movement(movement_type, item_id, bin_id, lot_id, qty, source_type, source_id)
-    SELECT 'production_issue', mil.component_item_id, mil.from_bin_id, mil.lot_id, -mil.qty, 'material_issue', mil.id
+    SELECT 'production_issue', mil.component_item_id, mil.from_bin_id, mil.lot_id, -mil.qty_base, 'material_issue', mil.id
     FROM material_issue_line mil WHERE mil.issue_id = v_mi;
 
     -- 6b. Nhập bulk: tạo lô SF-CREAM 50kg (quarantine) vào bin Tạm trữ khu TP.
@@ -226,7 +267,7 @@ BEGIN
     JOIN _bin bn ON bn.item_id = mom.component_item_id
     WHERE mom.mo_id = v_mo_fg;
     INSERT INTO inventory_movement(movement_type, item_id, bin_id, lot_id, qty, source_type, source_id)
-    SELECT 'production_issue', mil.component_item_id, mil.from_bin_id, mil.lot_id, -mil.qty, 'material_issue', mil.id
+    SELECT 'production_issue', mil.component_item_id, mil.from_bin_id, mil.lot_id, -mil.qty_base, 'material_issue', mil.id
     FROM material_issue_line mil WHERE mil.issue_id = v_mi;
 
     -- 7b. Nhập thành phẩm: lô FG-CREAM50 x1000 (quarantine) vào Tạm trữ khu TP.

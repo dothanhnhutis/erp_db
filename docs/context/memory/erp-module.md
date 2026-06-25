@@ -1,0 +1,52 @@
+---
+name: erp-module
+description: "ERP nhà máy mỹ phẩm trong initdb/004_test.sql — đợt 1/2/3/4 đã xong + quy ước module"
+metadata: 
+  node_type: memory
+  type: project
+  originSessionId: b71bd957-6d9f-46d7-8a2a-bdbde595a2c2
+---
+
+Module ERP (mỹ phẩm) ở `initdb/004_test.sql`, chạy CHUNG DB với core RBAC (001/002). Luồng: PR → PO (nhiều đợt nhận) → goods_receipt → QC → nhập kho theo bin/lô.
+
+**Quy ước module (khác core):**
+- PK = `bigint GENERATED ALWAYS AS IDENTITY` (không phải uuidv7 như core). Who-fields (`requested_by`/`approved_by`/`created_by`/`received_by`/`inspected_by`) = **FK uuid → users(id)**.
+- Dùng **native ENUM** (pr_status, po_status, item_type, zone_type, bin_type, movement_type, qc_status...) — core thì dùng CHECK; chấp nhận khác nhau giữa 2 module.
+- **Tích hợp 002:** KHÔNG định nghĩa lại `set_updated_at()`; cuối 004 có 2 DO-block re-attach updated_at + audit cho bảng ERP, **loại `inventory_movement`** khỏi audit (ledger bất biến). [[schema-scope-decisions]]
+- Tiền/khối lượng = NUMERIC. Catch-weight: `declared_qty` vs `received_qty`.
+
+**Đợt 1 (ĐÃ XONG + verify trên DB thật):**
+- Item master: `item.item_type`; `base_uom_id`=đơn vị chính lưu kho; `item_uom_conversion`=UOM khác.
+- WMS 3 cấp: `location` → `warehouse_zone`(zone_type) → `storage_bin`(bin_type: TEMPORARY/PRESERVATION/DISPOSAL/RETURNS). (Đã đổi `warehouse`→`location`.)
+- QC-trước-khi-nhập: nhận vào bin Tạm trữ (TEMPORARY) + lô `quarantine` → `qc_inspection` đạt → transfer sang bin Bảo quản (PRESERVATION) + lô `approved`. Tồn KHẢ DỤNG = bin PRESERVATION + lô approved (view `v_available_stock`).
+- Tồn theo (bin,item,lô) qua ledger `inventory_movement` (đã đổi warehouse_id→bin_id + movement_type). Views: `v_stock_on_hand`, `v_available_stock`, `v_lot_traceability`, `v_po_line_progress`, `v_receipt_variance`.
+
+**Đợt 2 (ĐÃ XONG + verify):** chèn TRƯỚC mục 10 của 004 (để tự gắn trigger). `bom`/`bom_line` (đa cấp; partial unique `uq_bom_active`), `production_plan(_line)`, `production_order(_material)` (định mức 1 cấp), MRP: view đệ quy `v_mrp_gross_requirement` (nổ tới NVL leaf=item không có active BOM, có path-guard chống vòng + scrap) → `v_mrp_netting` (gross − v_available_stock − open PO) → snapshot `mrp_run`/`mrp_requirement` → sinh PR (PR.mrp_run_id + mrp_requirement.pr_line_id). MRP chạy theo plan status='confirmed'. Lưu ý CTE: ép `planned_qty::numeric` ở anchor để khớp kiểu nhánh đệ quy.
+**Giới hạn đợt 2:** netting chỉ ở NVL đi mua, CHƯA trừ tồn bán-thành-phẩm trung gian (level-by-level netting để sau).
+
+**Đợt 3 (ĐÃ XONG + verify trên DB thật):** thực thi SX, chèn TRƯỚC mục 10 (tự gắn trigger).
+- `material_issue(_line)` (xuất NVL theo lô từ bin PRESERVATION) + `production_receipt(_line)` (nhập TP, tạo lô FG nội bộ `lot.supplier_id` NULL). 2 movement_type mới `production_issue`/`production_receipt`. Post ledger bằng APP (không auto-post trigger — đồng nhất đợt 1).
+- QC thành phẩm: tổng quát hoá `qc_inspection` (`gr_line_id` NULLable + cột `production_receipt_line_id` + CHECK `chk_qc_one_source` = num_nonnulls=1). Lô FG theo `item.requires_qc`: true → quarantine vào TEMPORARY → QC đạt → transfer PRESERVATION; false → approved thẳng PRESERVATION. Tái dùng nguyên `v_available_stock`.
+- Genealogy (granularity = MO): `v_lot_genealogy_edge` (mọi lô vào của 1 MO là cha mọi lô ra) + `v_lot_genealogy_forward`/`_backward` (đệ quy, path-guard <20). Views khác: `v_mo_material_status`, `v_mo_completion`, `v_issue_fefo_candidate` (FEFO theo expiry).
+- MRP level-by-level: hàm `fn_run_mrp(plan_id, run_no, run_by)` PL/pgSQL low-level-code — gộp gross qua MỌI nhánh TRƯỚC khi net tồn rồi mới nổ → trừ tồn bán-thành-phẩm đúng 1 lần cả khi 1 SF dùng nhiều TP. Ghi `mrp_requirement` mọi cấp (FG/SF/RM); leaf không-BOM net>0 = đi mua → PR. View đợt-2 `v_mrp_netting` giữ làm quick-look 1 mức. Verify: tồn SF=20 → RM1 net 39.6 (vs đợt-2 57.2, chênh 17.6 = 20×0.88).
+
+**Đợt 4 (ĐÃ XONG + verify trên DB thật):** chèn SAU `fn_run_mrp`, TRƯỚC mục 10. KHÔNG thêm bảng (chỉ +3 cột/+2 hàm/+3 view) → mục 10 không đổi; cột mới tự audit. ALTER: `production_order.mrp_run_id`, `mrp_requirement.production_order_id`, `lot.unit_cost numeric(18,6)`.
+- Auto-MO: `fn_generate_production_orders(mrp_run_id, prefix, created_by)` — sinh MO cho MỌI item SX (active BOM) net>0 (cả FG lẫn SF), tự sinh `production_order_material` (nổ BOM 1 cấp+scrap), gắn `mrp_requirement.production_order_id`, idempotent (bỏ req đã có MO). `mo_no`=prefix-run-reqid. Item mua (không BOM) vẫn đi PR. Dùng data-modifying CTE (ins_mo/upd/ins_mat) rồi `SELECT count(*) INTO ... FROM ins_mo`.
+- Genealogy định lượng: view `v_lot_genealogy_alloc` (mức MO, 1 cấp) — alloc_qty = consumed_qty × produced_qty/total_produced (bảo toàn KL: Σ theo con = consumed). Bổ sung cho `v_lot_genealogy_edge`/`_forward`/`_backward` của đợt 3.
+- Giá vốn THỰC theo lô (actual costing, CHỈ NVL): hàm `fn_roll_lot_cost()` PL/pgSQL — lô mua = Σ(GR received×unit_price)/Σreceived; lô SX cuộn bottom-up tới fixpoint (≤20 pass): MO unit = Σ(issue.qty×input_lot.unit_cost)/Σ produced (đồng giá mọi lô ra MO). Temp `_lc` → đồng bộ về `lot.unit_cost` CHỈ lô đổi (audit tối thiểu); lô thiếu cơ sở giá để NULL. Views `v_inventory_valuation` (tồn ledger × lot.unit_cost) + `v_mo_cost`. Verify: RM1=10 → SF1=8.8 (440/50) → FG1=2.64 (264/100).
+
+**SEED + TÀI LIỆU (ĐÃ XONG + verify):** init chạy `001`→`007` (mount `./initdb`). Hai file seed ERP MỚI (INSERT khai báo, tra cứu theo `code`, chạy 1 lần — KHÔNG dùng CSV như 005):
+- `006_erp_seed.sql` = DANH MỤC (mô hình): 5 uom, 3 supplier, 17 item, 4 BOM (20 dòng), 1 location → 4 zone → 16 bin. Nhà máy "ABC" (kem dưỡng + sữa rửa mặt).
+- `007_erp_demo.sql` = LUỒNG demo end-to-end trong 1 DO block (RAISE NOTICE kể bước): kế hoạch 1000 FG-CREAM50 → fn_run_mrp → fn_generate_production_orders → PO/GR/QC → material_issue → production_receipt → fn_roll_lot_cost. Số chốt: SF-CREAM 61.4/kg, FG-CREAM50 6.27/cái, tổng giá trị tồn 7460. (Optional cho prod.)
+- `ERP.md` (gốc repo) = giải thích "dễ hiểu": câu chuyện + sơ đồ ASCII (master + chuỗi chứng từ) + bảng dữ liệu + 12 truy vấn mẫu. **Đã sửa DEPLOY.md** mục 4/5: bổ sung chạy `004` (trước thiếu!) + `006`/`007`.
+- 2 lỗi đã gặp khi viết 007: `%` literal trong RAISE phải escape `%%`; CASE trả text gán cột ENUM phải ép `::qc_status`.
+
+**ĐA ĐƠN VỊ / UOM (ĐÃ XONG + verify):** chứng từ chọn đơn vị tự do, hệ quy về base. Mô hình HỖN HỢP:
+- `uom` thêm `dimension` (enum `uom_dimension`: MASS/VOLUME/COUNT/LENGTH/PACK) + `ratio_to_anchor` (PACK=NULL); bỏ `is_base_weight`. `item_uom_conversion` đổi shape → `(item_id, uom_id, factor_to_base)` (PACK đóng gói theo item).
+- `fn_to_base(item, qty, uom)` STABLE: base→qty; rule item-specific; cùng dimension qua ratio; else RAISE. Wiring: MỌI bảng dòng có qty thêm cột `*_base`, TRIGGER `trg_qtybase` (BEFORE) tự điền — generic `fn_fill_qty_base` (TG_ARGV qua jsonb) cho 7 bảng; riêng `fn_fill_pol_base` (PO line có generated line_amount), `fn_fill_grl_base` (GR 2 cột), `fn_fill_prl_base` (production_receipt_line lấy item qua lot). Mục 11 trong 004.
+- MỌI view/hàm tính theo `*_base`: v_mrp_gross_requirement (`qty_base/output_qty_base`), fn_run_mrp (`planned_qty_base`), fn_generate_production_orders (required ở base component), fn_roll_lot_cost (`/received_qty_base`, `mil.qty_base`, `produced_qty_base`), v_po_line_progress/v_mo_material_status/v_mo_completion/v_lot_genealogy_alloc. Ledger `inventory_movement.qty` = `*_base`. unit_price theo đơn vị dòng; giá vốn/base = tiền/qty_base.
+- Demo (007): glycerin base=**g**, PO 20 kg → ordered_qty_base 20000, GR 1 thùng → received_qty_base 20000 (1 thùng=20000g), tồn 12500g, lô 0.04/g; FG-CREAM50 vẫn 6.27/cái; tổng giá trị tồn 7860. Trả lời "uom table có cần thiết không": CÓ — giữ & làm mạnh.
+- **3 ca quy đổi** (= 3 nhánh fn_to_base): (1) cùng dimension khác ratio → TỰ ĐỘNG qua `uom.ratio_to_anchor` (kg↔g, khỏi khai); (2) KHÁC dimension → `item_uom_conversion` làm **cầu tỷ trọng** (lít→kg, vd cồn); (3) PACK → `item_uom_conversion` theo item. Tức `item_uom_conversion` KHÔNG chỉ cho PACK — còn bắc cầu VOLUME→MASS.
+- **View `v_item_valid_uom`** (mục 11.5 của 004): đơn vị hợp lệ/item cho UI dropdown, chính sách **HẸP (allow-list)** = base + item_uom_conversion (bỏ nhánh toàn cục; muốn hiện đơn vị cùng dimension phải khai tường minh). Seed 006 thêm 2 dòng: `(SOL-ETHANOL, lit, 0.785)` cồn base kg mua theo lít (15.7/20); `(RM-GLYCERIN, kg, 1000)` để kg hiện trong allow-list. KHÔNG đổi số liệu demo (verify lại: 7860, FG 6.27). ERP.md §3b/§6 cập nhật.
+
+**Còn lại (đợt 5 — nếu cần):** overhead/nhân công vào giá vốn (thêm cột chi phí/MO); truyền định lượng genealogy ĐA CẤP (nhân tỷ lệ dọc chuỗi); tích hợp GL/kế toán; cấp phát lô SX tự động theo FEFO.

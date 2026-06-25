@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Local/scratch
+*.local
+*.log
+
+# Env (không commit bí mật thật)
+.env
+.env.*
+!.env.example

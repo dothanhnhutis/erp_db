@@ -1,0 +1,55 @@
+id,code,description
+019c0cd2-374d-789f-bd3c-b9509330b997,USER_VIEW,Xem danh sách user
+019c0cd2-3750-7d95-b0c2-88b64df6a947,USER_CREATE,Tạo user
+019c0cd2-3750-7ead-8cb0-3a8eee5611b0,USER_UPDATE,Cập nhật user
+019c0cd2-3750-7f3e-91a8-49344f152322,USER_DELETE,Xoá user
+019c0cd2-3750-7fc5-86b4-7a3f77bd5a54,ROLE_VIEW,Xem role
+019c0cd2-3751-7049-8687-cca003aa2cb7,ROLE_CREATE,Tạo role
+019c0cd2-3751-70ca-be57-f52d9c310b4e,ROLE_UPDATE,Cập nhật role
+019c0cd2-3751-7176-8e97-ca2def7481ea,ROLE_DELETE,Xoá role
+019c0cd2-3751-7221-8563-f8aad7915c4b,RAW_MATERIAL_VIEW,Xem nguyên liệu thô
+019c0cd2-3751-7463-88cb-51f4e3a2c1eb,RAW_MATERIAL_CREATE,Tạo nguyên liệu thô
+019c0cd2-3751-753f-991d-fbe57deebd42,RAW_MATERIAL_UPDATE,Cập nhật nguyên liệu thô
+019c0cd2-3751-75d0-b385-03d435af7008,RAW_MATERIAL_DELETE,Xoá nguyên liệu thô
+019c0cd2-3751-7658-aece-520f74c19b71,ORDER_VIEW,Xem đơn nhập
+019c0cd2-3751-76d8-b73a-e982e0099c30,ORDER_CREATE,Tạo đơn nhập
+019c0cd2-3751-775c-a8c4-c2e86049f732,ORDER_UPDATE,Cập nhật đơn nhập
+019c0cd2-3751-77e4-bdce-e9337c242887,ORDER_CANCEL,Huỷ đơn nhập
+019c0cd2-3751-7860-8b85-9c86c6e5bf01,RECEIPT_VIEW,Xem phiếu nhận
+019c0cd2-3751-78e6-9614-03f6ac611fe3,RECEIPT_CREATE,Tạo phiếu nhận
+019ea1e1-6cea-78cd-89b2-6c5cfc2fd6d9,LOCATION_VIEW,Xem kho
+019ea1e1-6cea-7e45-a91b-51d184281607,LOCATION_CREATE,Tạo kho
+019ea1e1-6cea-7e94-824d-956f0d1c3da1,LOCATION_UPDATE,Cập nhật kho
+019ea1e1-6cea-7ec6-ab78-a644bce755ae,LOCATION_DELETE,Xóa kho
+019ea1e1-6cea-7ef9-aa58-71dcd7b62a3c,ZONE_VIEW,Xem khu vực kho
+019ea1e1-6cea-7f20-af93-31fcb795338e,ZONE_CREATE,Tạo khu vực kho
+019ea1e1-6cea-7f49-93f2-3e66e95469c6,ZONE_UPDATE,Cập nhật khu vực kho
+019ea1e1-6cea-7f73-b2e9-11d946fc6a9b,ZONE_DELETE,Xóa khu vực kho
+019ea1e1-6cea-7f9d-b91d-19bd05f8382f,BIN_VIEW,Xem kệ lưu trữ
+019ea1e1-6cea-7fcf-8d7e-0377df89f282,BIN_CREATE,Tạo kệ lưu trữ
+019ea1e1-6cea-7ff9-a26e-143326aeedc7,BIN_UPDATE,Cập nhật kệ lưu trữ
+019ea1e1-6ceb-7021-a173-8bb2f0f00189,BIN_DELETE,Xóa kệ lưu trữ
+52be7e8b-6c7f-4e3a-8db2-1c943c0a4d5b,VENDOR_VIEW,Xem nhà cung cấp
+bf8681f2-b76f-419a-8bcc-99fbef61da9d,VENDOR_CREATE,Tạo nhà cung cấp
+19eb6485-2045-47eb-9421-d49a7b07e8d4,VENDOR_UPDATE,Cập nhật nhà cung cấp
+338233dc-74ea-4ddc-bf6c-c4541a07f13e,VENDOR_DELETE,Xoá nhà cung cấp
+8f1d877b-6636-4846-8e80-b60ae258ae4b,PACKAGING_VIEW,Xem bao bì
+8b0b5ad6-a852-4a0b-83ba-9c3149671400,PACKAGING_CREATE,Tạo bao bì
+7aa970e2-6f03-4438-bd1d-dd3e678856c6,PACKAGING_UPDATE,Cập nhật bao bì
+ba831ddb-106c-462b-9d0d-12e8c070b829,PACKAGING_DELETE,Xoá bao bì
+da1db4af-3b51-4721-ad16-fd4c39eea3e5,UTILITY_VIEW,Xem vật tư tiện ích
+828d8bc6-3b99-44cb-a6dd-ad0a69a11897,UTILITY_CREATE,Tạo vật tư tiện ích
+15b4a36b-0d22-4230-8a01-f753195e1688,UTILITY_UPDATE,Cập nhật vật tư tiện ích
+5029dbbd-7a9b-4ceb-9303-7d8f21b1dfbe,UTILITY_DELETE,Xoá vật tư tiện ích
+e53efda0-9701-4890-97bf-f8e79a70bd0e,SEMI_FINISHED_VIEW,Xem bán thành phẩm
+eaee6b07-68fe-4dd0-ab47-327986b115a8,SEMI_FINISHED_CREATE,Tạo bán thành phẩm
+a25830ba-dc73-4e76-a9ba-9f030f5c61a8,SEMI_FINISHED_UPDATE,Cập nhật bán thành phẩm
+c60eae13-fe61-4475-b73f-899b6adb6088,SEMI_FINISHED_DELETE,Xoá bán thành phẩm
+a9b39691-8e31-4394-9427-b5d02441cf9c,FINISHED_GOODS_VIEW,Xem thành phẩm
+471ad8bb-98ed-4b4e-952d-1d7f4288e93a,FINISHED_GOODS_CREATE,Tạo thành phẩm
+476ca137-51f1-43ae-bd1f-75060addf1da,FINISHED_GOODS_UPDATE,Cập nhật thành phẩm
+a42e34b6-540c-4962-8a4f-466a71453002,FINISHED_GOODS_DELETE,Xoá thành phẩm
+756a9444-cdb6-4245-bb7f-0d388ce8d8bf,BOM_VIEW,Xem định mức BOM
+b5e45462-5161-4bac-a9b4-540f71a15892,BOM_CREATE,Tạo định mức BOM
+08896442-dfec-40f9-a6e9-4dd97e240fe6,BOM_UPDATE,Cập nhật định mức BOM
+781b8451-0d78-4771-ab30-ccb2056a5c4d,BOM_DELETE,Xoá định mức BOM
