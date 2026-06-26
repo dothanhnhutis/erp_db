@@ -5,7 +5,7 @@ về quyết định schema và tiến độ Module ERP. Mục đích: chuyển 
 
 ## Có gì ở đây
 - `memory/MEMORY.md` — chỉ mục bộ nhớ (mỗi dòng 1 ghi chú).
-- `memory/erp-module.md` — toàn bộ Module ERP (đợt 1–5b: + nhận hàng không-PO, cho mượn, **bán hàng/AR**) & quy ước module.
+- `memory/erp-module.md` — toàn bộ Module ERP (đợt 1–6: + nhận hàng không-PO, cho mượn, bán hàng/AR, **vật chứa/HU**) & quy ước module.
 - `memory/schema-scope-decisions.md` — quy ước sửa schema Core, phần đã hardening, phần còn optional.
 
 > Đây chỉ là ghi chú kỹ thuật, **không chứa bí mật**. Tài khoản trong `data/users.csv` đã được sanitize.

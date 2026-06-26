@@ -246,6 +246,28 @@ khách hàng ─► sales_order(_line) ─(xác nhận)─► sales_shipment(_li
 
 ---
 
+## 4e. QUẢN LÝ VẬT CHỨA (đợt 6 — handling unit / HU): phuy → chiết can, theo dõi từng vật chứa
+
+Nhập 1 phuy 300 kg rồi **chiết ra nhiều can nhỏ** để dùng → cần theo dõi TỪNG vật chứa (barcode, vị trí, lượng).
+HU là **lớp định danh phủ lên sổ cái** (KHÔNG thay mô hình tồn):
+
+```
+inventory_movement + cột hu_id (NOT NULL)  ──►  tồn theo HU = Σ ledger theo hu_id
+v_stock_on_hand (gộp bin,item,lô) GIỮ NGUYÊN  ──►  HU chỉ "tag" thêm 1 chiều
+```
+
+- **Bắt buộc mọi item**: trigger `trg_fill_hu` (BEFORE INSERT) tự điền `hu_id` — tìm HU của lô; chưa có thì **tạo
+  vật chứa mặc định** theo `item_type`. Chạy TRƯỚC khi kiểm NOT NULL ⇒ **không thể có tồn ngoài vật chứa**. (Luồng
+  Bước 5-10 KHÔNG sửa 1 dòng — HU tự gắn → hồi quy 6.27/61.4 bất biến.)
+- **`handling_unit`**: hu_no/barcode, `container_type`, item, lô, `current_bin` (suy từ ledger), `parent_hu` (pallet
+  lồng), `status`, `tare/gross` (catch-weight), `opened_at` (mở nắp). Lượng chứa = Σ ledger (không lưu cột → không lệch).
+- **Thao tác** (ledger `repack` cho HU↔HU cùng bin/lô, net=0): **chiết/tách** phuy→can, **gộp** (merge), **di chuyển**
+  (transfer + hu_id), **pallet lồng** (`parent_hu`), **cân từng HU** (net = gross − tare), **mở nắp** (hạn sau mở =
+  `opened_at` + `item.shelf_life_after_open_days`).
+- **`v_hu_reconcile`** (guard hồi quy): Σ tồn theo HU = `v_stock_on_hand` (lệch = 0) ⇒ HU không phá tồn/giá vốn.
+
+---
+
 ## 5. Kịch bản DEMO (007): sản xuất 1000 hộp Kem dưỡng 50ml
 
 | Bước | Việc | Kết quả |
@@ -261,6 +283,7 @@ khách hàng ─► sales_order(_line) ─(xác nhận)─► sales_shipment(_li
 | 8 | `fn_roll_lot_cost` | bulk **61.4/kg**, FG-CREAM50 **6.27/cái** |
 | 9 | **Cho mượn & nhận lại** `MLOAN-01`: NM-XYZ mượn 5 kg glycerin → trả lại 3 kg | còn cho mượn **2000 g**; tồn kho + đang-cho-mượn **bảo toàn** |
 | 10 | **Bán hàng** `SO-DEMO-01`: CUST-Z mua 100 hộp FG-CREAM50 @20 → giao (COGS 627) → HĐ VAT 8% (2160) → thu 1000. **loan→sale**: NM-XYZ mua nốt 2 kg glycerin đang mượn | doanh thu **2000**+**100**; khoản mượn **đóng** (outstanding 0); phải thu **Z 1160 + XYZ 108** |
+| 11 | **Vật chứa (HU)** `RM-DRUM300`: nhập phuy 300kg → **chiết 3 can** → cân/gộp/mở nắp/pallet lồng → move → dùng 50 | 14 HU tự tạo (Bước 5-10) + phuy/can/pallet; tồn **250** (can1 100 + can3 150); đối soát HU↔tồn **0 lệch** |
 
 Giá vốn 1 hộp Kem 50ml = **6.27** được cuộn từ:
 
@@ -294,6 +317,10 @@ Bulk 1kg = 35·2(nước) + 7.5·40(glycerin) + 4.2·500(argan) + 2.5·120(lô h
 | Hoá đơn: net / VAT / tổng | `v_invoice_totals` |
 | Công nợ phải thu theo tuổi / ai nợ tiền | `v_ar_aging` |
 | Tiến độ giao theo dòng đơn bán | `v_so_line_fulfillment` |
+| Tồn + vị trí TỪNG vật chứa (HU) | `v_hu_stock`, `v_bin_hu` |
+| Pallet lồng HU con (cây) | `v_hu_tree` |
+| Đối soát HU ↔ tồn sổ cái (guard) | `v_hu_reconcile` |
+| HU đã mở nắp & hạn sau mở | `v_hu_expiring_after_open` |
 
 ---
 
@@ -452,6 +479,21 @@ SELECT customer_name, SUM(outstanding_amount) "còn_nợ" FROM v_ar_aging GROUP 
 ```
 → Bán thường `DO-DEMO-01` lãi gộp **2000 − 627 = 1373**; loan→sale `DO-DEMO-02` **100 − 80 = 20**. Hoá đơn:
 `INV-DEMO-01` **2000/160/2160** (thu 1000 → còn **1160**), `INV-DEMO-02` **100/8/108**. Phải thu: **Z 1160 + XYZ 108**.
+
+### 7.16 Vật chứa (HU): tồn từng can, pallet lồng, đối soát
+```sql
+-- tồn + vị trí + trạng thái + cân từng vật chứa của 1 item (phuy/can)
+SELECT hu_no, container_type, status, qty_base, current_bin_id, net_weight
+FROM v_hu_stock WHERE item_id=(SELECT id FROM item WHERE code='RM-DRUM300') ORDER BY hu_no;
+-- pallet lồng những HU con nào
+SELECT p.hu_no "pallet", c.hu_no "con" FROM v_hu_tree t
+JOIN handling_unit p ON p.id=t.root_hu_id JOIN handling_unit c ON c.id=t.hu_id
+WHERE p.hu_no='HU-PLT-01' AND t.lvl>0;
+-- ĐỐI SOÁT: tồn theo HU = tồn sổ cái (phải 0 dòng lệch)
+SELECT count(*) "so_dong_lech" FROM v_hu_reconcile WHERE diff <> 0;
+```
+→ phuy `HU-DRUM-01` **rỗng** (đã chiết), `HU-CAN-01` **100** (đã mở nắp, net=gross−tare=100), `HU-CAN-03` **150**
+(gộp từ can2), `HU-CAN-02` **merged**; pallet `HU-PLT-01` lồng can1+can3. Đối soát **0 lệch** ⇒ HU khớp tồn sổ cái.
 
 ---
 

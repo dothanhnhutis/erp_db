@@ -56,6 +56,15 @@ DECLARE
     v_ship_line_loan bigint;
     v_inv_z          bigint;   -- hoá đơn CUST-Z
     v_inv_xyz        bigint;   -- hoá đơn CUST-XYZ (loan->sale)
+    -- ĐỢT 6 — vật chứa (handling unit)
+    v_lot_drum   bigint;
+    v_hu_drum    bigint;
+    v_hu_can1    bigint;
+    v_hu_can2    bigint;
+    v_hu_can3    bigint;
+    v_hu_plt     bigint;
+    v_bin_d_bq   bigint;
+    v_bin_d_tt   bigint;
 BEGIN
     -- Bảng tra cứu tạm: bin Tạm trữ (TT) & Bảo quản (BQ) theo KHU của từng item.
     --   item_type -> zone_type: RAW_MATERIAL->ZRM, PACKAGING->ZPK, SOLVENT->ZSOL,
@@ -449,6 +458,58 @@ BEGIN
     VALUES (v_inv_xyz, v_ship_line_loan, (SELECT id FROM item WHERE code='RM-GLYCERIN'), 2, v_kg, 50);
     RAISE NOTICE 'Bước 10: Bán 100 hộp FG-CREAM50 (doanh thu 2000, COGS 627) + loan->sale 2 kg glycerin cho NM-XYZ -> khoản mượn ĐÓNG (outstanding 0); phải thu: Z 1160, XYZ 108.';
 
-    RAISE NOTICE '== DEMO HOÀN TẤT: kế hoạch -> MRP -> mua/nhập/QC -> SX -> giá vốn -> cho mượn/nhận lại -> BÁN HÀNG. Xem ERP.md. ==';
+    -- ===== BƯỚC 11: QUẢN LÝ VẬT CHỨA NÂNG CAO (đợt 6) — phuy -> chiết can -> cân/gộp/mở nắp/pallet/move/dùng =====
+    -- Item RM-DRUM300 (base kg, KHÔNG QC -> nhập thẳng Bảo quản), NGOÀI BOM kem -> không đụng hồi quy 6.27/61.4.
+    -- HU tường minh (truyền hu_id) -> trigger trg_fill_hu bỏ qua, cho phép NHIỀU HU/lô (chiết).
+    v_bin_d_bq := (SELECT bq_bin FROM _bin WHERE item_id=(SELECT id FROM item WHERE code='RM-DRUM300'));
+    v_bin_d_tt := (SELECT tt_bin FROM _bin WHERE item_id=(SELECT id FROM item WHERE code='RM-DRUM300'));
+
+    -- 11a. NHẬP 1 phuy 300 kg -> lô + vật chứa DRUM + ledger nhập (hu = phuy).
+    INSERT INTO lot(lot_no, item_id, qc_status, manufacture_date)
+    VALUES ('L-DRUM-01', (SELECT id FROM item WHERE code='RM-DRUM300'), 'approved', current_date) RETURNING id INTO v_lot_drum;
+    v_hu_drum := fn_new_hu('DRUM', (SELECT id FROM item WHERE code='RM-DRUM300'), v_lot_drum, v_bin_d_bq, 'HU-DRUM-01');
+    INSERT INTO inventory_movement(movement_type, item_id, bin_id, lot_id, qty, unit_cost, source_type, source_id, hu_id)
+    VALUES ('receipt', (SELECT id FROM item WHERE code='RM-DRUM300'), v_bin_d_bq, v_lot_drum, 300, 25, 'goods_receipt', NULL, v_hu_drum);
+
+    -- 11b. CHIẾT (decant) phuy -> 3 can 100 kg (cùng bin/lô). repack: phuy(-300), can(+100)x3. Net=0 -> tồn lô không đổi.
+    v_hu_can1 := fn_new_hu('CAN', (SELECT id FROM item WHERE code='RM-DRUM300'), v_lot_drum, v_bin_d_bq, 'HU-CAN-01');
+    v_hu_can2 := fn_new_hu('CAN', (SELECT id FROM item WHERE code='RM-DRUM300'), v_lot_drum, v_bin_d_bq, 'HU-CAN-02');
+    v_hu_can3 := fn_new_hu('CAN', (SELECT id FROM item WHERE code='RM-DRUM300'), v_lot_drum, v_bin_d_bq, 'HU-CAN-03');
+    INSERT INTO inventory_movement(movement_type, item_id, bin_id, lot_id, qty, source_type, source_id, hu_id)
+    SELECT 'repack', (SELECT id FROM item WHERE code='RM-DRUM300'), v_bin_d_bq, v_lot_drum, d.q, 'repack', v_hu_drum, d.h
+    FROM (VALUES (-300::numeric, v_hu_drum), (100::numeric, v_hu_can1), (100::numeric, v_hu_can2), (100::numeric, v_hu_can3)) AS d(q, h);
+    UPDATE handling_unit SET status='empty', current_bin_id=NULL WHERE id=v_hu_drum;   -- phuy RỖNG sau khi chiết
+
+    -- 11c. CÂN TỪNG HU (catch-weight) can1: bì 2 kg, cả bì 102 kg -> net 100 kg (= lượng chứa).
+    UPDATE handling_unit SET tare_weight=2, gross_weight=102 WHERE id=v_hu_can1;
+
+    -- 11d. GỘP (merge) can2 -> can3 (cùng bin/lô). repack: can2(-100), can3(+100) -> can3=200, can2 rỗng/merged.
+    INSERT INTO inventory_movement(movement_type, item_id, bin_id, lot_id, qty, source_type, source_id, hu_id)
+    SELECT 'repack', (SELECT id FROM item WHERE code='RM-DRUM300'), v_bin_d_bq, v_lot_drum, d.q, 'repack', v_hu_can2, d.h
+    FROM (VALUES (-100::numeric, v_hu_can2), (100::numeric, v_hu_can3)) AS d(q, h);
+    UPDATE handling_unit SET status='merged', current_bin_id=NULL WHERE id=v_hu_can2;
+
+    -- 11e. MỞ NẮP can1 -> opened_at = nay; hạn sau mở = nay + 30 ngày (item.shelf_life_after_open_days).
+    UPDATE handling_unit SET opened_at = now() WHERE id=v_hu_can1;
+
+    -- 11f. PALLET LỒNG: tạo 1 pallet, lồng can1 + can3 (parent_hu_id = pallet) -> v_hu_tree.
+    v_hu_plt := fn_new_hu('PALLET', NULL, NULL, v_bin_d_bq, 'HU-PLT-01');
+    UPDATE handling_unit SET parent_hu_id=v_hu_plt WHERE id IN (v_hu_can1, v_hu_can3);
+
+    -- 11g. DI CHUYỂN pallet (kéo theo HU con) Bảo quản -> Tạm trữ. Mỗi can: transfer (-BQ, +TT) cùng hu.
+    INSERT INTO inventory_movement(movement_type, item_id, bin_id, lot_id, qty, source_type, source_id, hu_id)
+    SELECT 'transfer', (SELECT id FROM item WHERE code='RM-DRUM300'), b.bin, v_lot_drum, b.q, 'hu_move', v_hu_plt, b.h
+    FROM (VALUES
+        (v_bin_d_bq, -100::numeric, v_hu_can1), (v_bin_d_tt, 100::numeric, v_hu_can1),
+        (v_bin_d_bq, -200::numeric, v_hu_can3), (v_bin_d_tt, 200::numeric, v_hu_can3)
+    ) AS b(bin, q, h);
+    UPDATE handling_unit SET current_bin_id=v_bin_d_tt WHERE id IN (v_hu_plt, v_hu_can1, v_hu_can3);
+
+    -- 11h. DÙNG 1 phần: xuất 50 kg từ can3 (200 -> 150). movement 'issue' gắn hu=can3.
+    INSERT INTO inventory_movement(movement_type, item_id, bin_id, lot_id, qty, source_type, source_id, hu_id)
+    VALUES ('issue', (SELECT id FROM item WHERE code='RM-DRUM300'), v_bin_d_tt, v_lot_drum, -50, 'manual_use', NULL, v_hu_can3);
+    RAISE NOTICE 'Bước 11: HU — nhập phuy 300kg -> chiết 3 can -> cân can1(net 100) -> gộp can2 vào can3(200) -> mở nắp can1 -> pallet lồng can1+can3 -> move sang Tạm trữ -> dùng 50 từ can3. Tồn RM-DRUM300: can1 100 + can3 150 = 250.';
+
+    RAISE NOTICE '== DEMO HOÀN TẤT: kế hoạch -> MRP -> mua/nhập/QC -> SX -> giá vốn -> cho mượn/nhận lại -> BÁN HÀNG -> VẬT CHỨA(HU). Xem ERP.md. ==';
 END
 $$;

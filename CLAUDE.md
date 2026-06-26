@@ -73,9 +73,16 @@ docker compose -f docker-compose.dev.yaml down -v && docker compose -f docker-co
   `v_invoice_totals`, `v_ar_aging`, `v_so_line_fulfillment`. **loan→sale**: bán hàng đang-cho-mượn → dòng giao
   `loan_line_id` + `from_bin_id NULL` → KHÔNG post ledger (hàng đã rời kho ở `loan_out`); `v_material_loan_status`
   trừ thêm `sold_qty_base`. Bán chỉ ĐỌC giá lô → `fn_roll_lot_cost` KHÔNG đổi.
+- **Đợt 6**: **VẬT CHỨA (handling unit)** (khối 6 của 004) — theo dõi TỪNG phuy/can/pallet. `container_type` +
+  `handling_unit` (hu_no/barcode, item, lô, current_bin suy-từ-ledger, parent_hu pallet lồng, status, tare/gross
+  catch-weight, opened_at). Thêm `inventory_movement.hu_id` **NOT NULL** (bắt buộc mọi item) — trigger `trg_fill_hu`
+  (BEFORE INSERT) tự điền (tìm HU của lô / tạo vật chứa mặc định theo item_type) → demo Bước 5-10 KHÔNG sửa dòng nào,
+  hồi quy bất biến. movement_type `repack` (chiết/gộp). View `v_hu_stock`/`v_bin_hu`/`v_hu_tree`(đệ quy)/
+  `v_hu_reconcile`(guard: Σ HU = v_stock_on_hand, lệch=0)/`v_hu_expiring_after_open`. `item.shelf_life_after_open_days`.
+  Demo Bước 11 (item `RM-DRUM300` ngoài BOM): chiết→cân→gộp→mở nắp→pallet lồng→move→dùng.
 - **Số chốt demo (007)**: SF-CREAM **61.4/kg**, FG-CREAM50 **6.27/cái**, glycerin **0.04/g** (mốc hồi quy giá vốn,
-  BẤT BIẾN). Tổng giá trị **tồn kho = 7643** sau Bước 10 (bán 100 hộp FG: −627 COGS; loan→sale không động kho).
-  Công nợ phải thu demo: Z 1160 + XYZ 108.
+  BẤT BIẾN). Tổng giá trị **tồn kho = 7643** sau Bước 10; **55 dòng ledger đều có hu_id** (NOT NULL), `v_hu_reconcile`
+  **0 lệch**. Công nợ phải thu demo: Z 1160 + XYZ 108.
 - **Đợt 5 (còn lại — chỉ gợi ý nếu user hỏi)**: overhead/nhân công vào giá vốn; truyền định lượng genealogy ĐA
   CẤP; cấp phát lô SX tự động theo FEFO; GL kế toán nâng cao (double-entry, trả hàng bán, bảng giá).
 

@@ -53,6 +53,11 @@ INSERT INTO item (code, name, item_type, base_uom_id, requires_qc, shelf_life_da
     ('RM-PRESV',    'Chất bảo quản Phenoxyethanol', 'RAW_MATERIAL', (SELECT id FROM uom WHERE code='kg'), true,  1095),
     ('RM-SURFACT',  'Chất tạo bọt SLES',            'RAW_MATERIAL', (SELECT id FROM uom WHERE code='kg'), true,  730);
 
+-- 3a-bis. Item cho DEMO VẬT CHỨA (đợt 6): phuy hoá chất 300kg, base kg, KHÔNG QC (nhập thẳng Bảo quản).
+--   shelf_life_after_open_days = hạn dùng SAU KHI MỞ NẮP (30 ngày). NGOÀI BOM kem -> không đụng hồi quy.
+INSERT INTO item (code, name, item_type, base_uom_id, requires_qc, shelf_life_days, shelf_life_after_open_days) VALUES
+    ('RM-DRUM300', 'Hoá chất lỏng (phuy 300kg)', 'RAW_MATERIAL', (SELECT id FROM uom WHERE code='kg'), false, 720, 30);
+
 -- 3b. Dung môi (SOLVENT)
 INSERT INTO item (code, name, item_type, base_uom_id, requires_qc, shelf_life_days) VALUES
     ('SOL-ETHANOL', 'Cồn Ethanol',                  'SOLVENT',      (SELECT id FROM uom WHERE code='kg'), true,  1095);
@@ -75,6 +80,17 @@ INSERT INTO item (code, name, item_type, base_uom_id, requires_qc, shelf_life_da
 INSERT INTO item (code, name, item_type, base_uom_id, requires_qc, shelf_life_days) VALUES
     ('FG-CREAM50',  'Kem dưỡng ẩm 50ml', 'FINISHED_GOOD', (SELECT id FROM uom WHERE code='cai'), true, 730),
     ('FG-WASH100',  'Sữa rửa mặt 100ml', 'FINISHED_GOOD', (SELECT id FROM uom WHERE code='cai'), true, 730);
+
+-- -----------------------------------------------------------------------------
+-- 3f. LOẠI VẬT CHỨA (đợt 6 — handling unit). is_pallet = lồng được HU con; default_tare = bì (catch-weight).
+-- -----------------------------------------------------------------------------
+INSERT INTO container_type (code, name, is_pallet, default_tare) VALUES
+    ('DRUM',   'Phuy',         false, 15),
+    ('CAN',    'Can nhỏ',      false, 2),
+    ('IBC',    'Bồn IBC',      false, 60),
+    ('CARTON', 'Thùng carton', false, 0.5),
+    ('BOTTLE', 'Chai',         false, 0),
+    ('PALLET', 'Pallet',       true,  20);
 
 -- -----------------------------------------------------------------------------
 -- 4. QUY ĐỔI ĐƠN VỊ THEO ITEM — 1 uom = factor_to_base × base_uom. Dùng cho 3 nhu cầu:

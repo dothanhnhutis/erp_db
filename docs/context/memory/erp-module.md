@@ -1,6 +1,6 @@
 ---
 name: erp-module
-description: "ERP nhà máy mỹ phẩm trong initdb/004_test.sql — đợt 1-5 (gồm 5a cho mượn, 5b bán hàng/AR) đã xong + quy ước module"
+description: "ERP nhà máy mỹ phẩm trong initdb/004_test.sql — đợt 1-6 (5a cho mượn, 5b bán hàng/AR, 6 vật chứa/HU) đã xong + quy ước module"
 metadata: 
   node_type: memory
   type: project
@@ -71,5 +71,17 @@ Module ERP (mỹ phẩm) ở `initdb/004_test.sql`, chạy CHUNG DB với core R
 - View: `v_so_line_fulfillment` (mirror v_po_line_progress), `v_sales_margin` (revenue−cogs), `v_invoice_totals` (net/tax/gross, ROUND 2), `v_ar_aging` (outstanding=gross−Σpayment, bucket current/1-30/31-60/61-90/90+; "ai nợ tiền"=group customer). **`v_material_loan_status` VIẾT LẠI** (chuyển từ 5a xuống 5b): +`sold_qty_base` (Σ sales_shipment_line qua loan_line_id, shipment posted), outstanding=lent−returned−sold; dùng 2 subquery TIỀN-GỘP (returns goods_receipt + sales sales_shipment) tránh fan-out (thay cách FILTER cũ của 5a).
 - Seed 006: 2 customer (`CUST-Z` credit_days 30; `CUST-XYZ` "Nhà máy XYZ" — đối tác từng MƯỢN). Demo 007 "Bước 10": (10a) CUST-Z mua 100 hộp FG-CREAM50 @20 → ledger sales_issue −100, COGS 627, lãi 1373, HĐ VAT8% net2000/tax160/gross2160, thu 1000 → còn 1160; (10b) loan→sale 2 kg glycerin @50 cho NM-XYZ → KHÔNG ledger, loan outstanding 0 → closed, HĐ net100/tax8/gross108. **Số chốt: FG 6.27 & glycerin 0.04 & SF 61.4 BẤT BIẾN; tổng tồn kho 8270→7643** (−627 COGS FG; loan→sale không động kho); phải thu Z 1160 + XYZ 108.
 - Bẫy: SO line generated → `fn_fill_sol_base` riêng; loan→sale post ledger CÓ ĐIỀU KIỆN (chỉ dòng `loan_line_id IS NULL`).
+
+**ĐỢT 6 — VẬT CHỨA (HANDLING UNIT / HU) — bắt buộc mọi item + nâng cao (ĐÃ XONG + verify trên DB thật):** khối "ĐỢT 6" SAU 5b, TRƯỚC mục 10. HU = lớp ĐỊNH DANH phủ lên sổ cái (KHÔNG thay mô hình tồn); tồn theo HU = Σ inventory_movement theo hu_id; `v_stock_on_hand` GIỮ NGUYÊN.
+- Enum: `movement_type` += `'repack'` (chiết/tách/gộp HU); mới `hu_status('active','empty','merged','consumed','scrapped')`.
+- Master `container_type` (code DRUM/CAN/IBC/CARTON/BOTTLE/PALLET, `is_pallet`, `default_tare`) — seed 6 loại ở 006.
+- `handling_unit` (hu_no/barcode unique, container_type, item NULL-able cho pallet, lot, current_bin_id cột-lưu, parent_hu_id self=pallet lồng, status, tare/gross catch-weight, opened_at mở-nắp, updated_at→audit). LƯỢNG chứa KHÔNG lưu → DERIVED = Σ ledger/hu_id.
+- ALTER `item` += `shelf_life_after_open_days`; ALTER `inventory_movement` += `hu_id bigint NOT NULL REFERENCES handling_unit` (bảng rỗng lúc init → NOT NULL hợp lệ). inventory_movement vẫn ngoài audit → hu_id ko audit.
+- **CHÌA KHOÁ — trigger `trg_fill_hu` (BEFORE INSERT) / `fn_fill_movement_hu`**: hu_id NULL → tìm HU active của lô; chưa có → TẠO vật chứa mặc định theo item_type (PACKAGING/FINISHED_GOOD→CARTON, SEMI→IBC, else DRUM) qua `nextval('hu_no_seq')`. Chạy TRƯỚC khi kiểm NOT NULL → ép "mọi tồn nằm trong 1 vật chứa". HỆ QUẢ: demo Bước 5-10 (18 INSERT inventory_movement) **KHÔNG SỬA 1 DÒNG** → hồi quy bất biến CHẮC CHẮN; Bước 11 truyền hu_id tường minh (nhiều HU/lô khi chiết) → trigger bỏ qua.
+- Helper `fn_new_hu(ctype, item, lot, bin, hu_no=NULL)` tạo HU record (KHÔNG post ledger — giữ app-post); dùng ở Bước 11.
+- View: `v_hu_stock` (qty_base=Σledger/hu_id; current_bin = COALESCE(bin có Σqty>0 suy-từ-ledger, cột lưu) — pallet ko ledger→cột; net_weight=gross−tare; expiry_after_open=opened_at+shelf_life_after_open_days); `v_bin_hu` (HU ở mỗi bin, qty<>0); `v_hu_tree` (đệ quy pallet→con, path-guard<20); **`v_hu_reconcile`** (GUARD: v_stock_on_hand vs Σ ledger-có-hu_id theo bin/item/lô, diff phải 0); `v_hu_expiring_after_open`.
+- Demo Bước 11 (item `RM-DRUM300` base kg, requires_qc=false, shelf_life_after_open_days=30, NGOÀI BOM → ko đụng hồi quy; lô KHÔNG cost-roll → 0 value, tổng vẫn 7643): nhập phuy 300kg (HU-DRUM-01) → CHIẾT 3 can 100 (repack drum−300/can+100×3 net=0, drum 'empty') → CATCH-WEIGHT can1 (tare2/gross102→net100) → MERGE can2→can3 (can3=200, can2 'merged') → MỞ NẮP can1 (opened_at) → PALLET HU-PLT-01 lồng can1+can3 (parent_hu) → MOVE pallet BQ→TT (transfer ±/can) → DÙNG 50 từ can3 (issue). Tồn 250 (can1 100+can3 150).
+- **Số chốt verify**: `hu_id is_nullable=NO`; 55 dòng ledger đều có hu_id; `v_hu_reconcile` 0 lệch; 14 HU tự tạo (7 CARTON/6 DRUM/1 IBC); hồi quy 6.27/61.4/0.04 + tổng 7643 + AR Z1160/XYZ108 + loan closed BẤT BIẾN.
+- Bẫy: trigger điền hu_id chạy TRƯỚC NOT NULL (BEFORE INSERT) nên ALTER NOT NULL OK; pallet item/lot NULL-able; current_bin DERIVE (cột lưu chỉ fallback); RM-DRUM300 ngoài BOM để ko phá hồi quy.
 
 **Còn lại (đợt 5 — nếu cần):** overhead/nhân công vào giá vốn (thêm cột chi phí/MO); truyền định lượng genealogy ĐA CẤP (nhân tỷ lệ dọc chuỗi); cấp phát lô SX tự động theo FEFO; GL kế toán nâng cao (double-entry, trả hàng bán/sales return, bảng giá).

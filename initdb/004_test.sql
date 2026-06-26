@@ -35,7 +35,7 @@ CREATE TYPE zone_type      AS ENUM ('RAW_MATERIAL','PACKAGING','FINISHED_GOODS',
 CREATE TYPE bin_type       AS ENUM ('TEMPORARY','PRESERVATION','DISPOSAL','RETURNS'); -- Tạm trữ/Bảo quản/Loại bỏ/Hàng trả về
 CREATE TYPE movement_type  AS ENUM ('receipt','transfer','qc_release','issue','adjustment','return',
                                    'production_issue','production_receipt',
-                                   'loan_out','loan_return','sales_issue'); -- đợt 3: xuất NVL SX/nhập TP; đợt 5a: cho mượn/nhận lại; đợt 5b: xuất bán
+                                   'loan_out','loan_return','sales_issue','repack'); -- đợt 3: xuất NVL SX/nhập TP; đợt 5a: cho mượn/nhận lại; đợt 5b: xuất bán; đợt 6: chiết/tách/gộp HU
 
 -- =============================================================================
 -- 1. DANH MỤC (MASTER DATA)
@@ -1460,6 +1460,163 @@ LEFT JOIN (
 
 -- #############################################################################
 -- ##########################  HẾT ĐỢT 5b  #####################################
+-- #############################################################################
+
+-- #############################################################################
+-- ##########################  ĐỢT 6 — QUẢN LÝ VẬT CHỨA (HANDLING UNIT)  #######
+-- #  Theo dõi TỪNG vật chứa vật lý (phuy/can/pallet) có barcode, vị trí, lượng #
+-- #  chứa. HU = lớp ĐỊNH DANH phủ lên sổ cái: thêm hu_id vào inventory_movement#
+-- #  -> tồn theo HU = Σ ledger theo hu_id (v_stock_on_hand GIỮ NGUYÊN). Bắt    #
+-- #  buộc mọi item (hu_id NOT NULL). Nâng cao: chiết/tách, gộp, pallet lồng    #
+-- #  (parent_hu), catch-weight (tare/gross->net), hạn dùng sau khi mở nắp.     #
+-- #############################################################################
+
+-- 6.0 Enum trạng thái HU + loại vật chứa (master).
+CREATE TYPE hu_status AS ENUM ('active','empty','merged','consumed','scrapped');
+--   active=đang dùng; empty=hết hàng; merged=đã gộp vào HU khác; consumed=xuất hết; scrapped=huỷ.
+CREATE TABLE container_type (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    code         varchar(20)  NOT NULL UNIQUE,             -- DRUM/CAN/PALLET/IBC/CARTON...
+    name         varchar(100) NOT NULL,
+    is_pallet    boolean      NOT NULL DEFAULT false,      -- true = vật chứa LỒNG được HU con (pallet)
+    default_tare numeric(18,4),                            -- bì mặc định (kg) cho catch-weight
+    note         text
+);
+
+-- 6.1 Vật chứa (handling unit / license-plate). LƯỢNG chứa KHÔNG lưu cột -> DERIVED = Σ ledger theo hu_id.
+CREATE TABLE handling_unit (
+    id                bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    hu_no             varchar(40)  NOT NULL UNIQUE,             -- barcode/license-plate
+    container_type_id bigint       NOT NULL REFERENCES container_type(id),
+    item_id           bigint       REFERENCES item(id),         -- NULL nếu pallet trộn nhiều item
+    lot_id            bigint       REFERENCES lot(id),          -- lô đang chứa (NULL cho pallet)
+    current_bin_id    bigint       REFERENCES storage_bin(id),  -- vị trí hiện tại (NULL khi consumed / nằm trên parent)
+    parent_hu_id      bigint       REFERENCES handling_unit(id),-- lồng trong pallet / HU cha
+    status            hu_status    NOT NULL DEFAULT 'active',
+    tare_weight       numeric(18,4),                            -- bì (kg) — catch-weight
+    gross_weight      numeric(18,4),                            -- cả bì (kg); net = gross - tare
+    opened_at         timestamptz,                              -- thời điểm MỞ NẮP -> hạn sau mở
+    note              text,
+    created_at        timestamptz  NOT NULL DEFAULT now(),
+    updated_at        timestamptz  NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_hu_item   ON handling_unit(item_id);
+CREATE INDEX idx_hu_lot    ON handling_unit(lot_id);
+CREATE INDEX idx_hu_bin    ON handling_unit(current_bin_id);
+CREATE INDEX idx_hu_parent ON handling_unit(parent_hu_id);
+
+-- 6.2 Hạn dùng SAU KHI MỞ NẮP cho item (NULL = không áp dụng).
+ALTER TABLE item ADD COLUMN shelf_life_after_open_days integer;
+
+-- 6.3 Gắn HU vào sổ cái: MỌI dòng ledger thuộc 1 vật chứa (NOT NULL — BẮT BUỘC). Bảng rỗng lúc init -> hợp lệ;
+--   trigger trg_fill_hu (6.4b) tự điền hu_id TRƯỚC khi kiểm NOT NULL -> mọi INSERT đều thoả (không thể có tồn ngoài HU).
+--   Tồn theo HU = Σ inventory_movement.qty theo hu_id. inventory_movement vẫn NGOÀI audit (mục 10) -> hu_id ko audit.
+ALTER TABLE inventory_movement ADD COLUMN hu_id bigint NOT NULL REFERENCES handling_unit(id);
+CREATE INDEX idx_invmov_hu ON inventory_movement(hu_id);
+
+-- 6.4 Helper: tạo 1 HU record (KHÔNG post ledger — giữ quy ước app-post ledger). Trả hu_id.
+CREATE SEQUENCE hu_no_seq;
+CREATE OR REPLACE FUNCTION fn_new_hu(p_ctype text, p_item bigint, p_lot bigint, p_bin bigint, p_hu_no text DEFAULT NULL)
+    RETURNS bigint LANGUAGE plpgsql AS
+$$
+DECLARE v_id bigint; v_ct bigint;
+BEGIN
+    SELECT id INTO v_ct FROM container_type WHERE code = p_ctype;
+    IF v_ct IS NULL THEN RAISE EXCEPTION 'container_type % không tồn tại', p_ctype; END IF;
+    INSERT INTO handling_unit(hu_no, container_type_id, item_id, lot_id, current_bin_id)
+    VALUES (COALESCE(p_hu_no, 'HU-'||p_ctype||'-'||lpad(nextval('hu_no_seq')::text, 4, '0')), v_ct, p_item, p_lot, p_bin)
+    RETURNING id INTO v_id;
+    RETURN v_id;
+END;
+$$;
+
+-- 6.4b BẮT BUỘC HU: trigger BEFORE INSERT tự điền hu_id cho MỌI dòng ledger.
+--   hu_id chưa có -> tìm HU đang active của lô; chưa có nữa -> TẠO 1 vật chứa mặc định (license-plate)
+--   theo item_type. Chạy TRƯỚC khi kiểm NOT NULL -> ÉP "mọi tồn phải nằm trong 1 vật chứa".
+--   (Bước 11 truyền hu_id tường minh khi chiết/gộp -> trigger bỏ qua, không ghi đè.)
+CREATE OR REPLACE FUNCTION fn_fill_movement_hu() RETURNS trigger LANGUAGE plpgsql AS
+$$
+DECLARE v_ct bigint;
+BEGIN
+    IF NEW.hu_id IS NOT NULL THEN RETURN NEW; END IF;                      -- HU tường minh -> giữ
+    SELECT id INTO NEW.hu_id FROM handling_unit
+     WHERE lot_id = NEW.lot_id AND status = 'active' ORDER BY id LIMIT 1;  -- HU sẵn có của lô
+    IF NEW.hu_id IS NULL THEN                                              -- chưa có -> tạo vật chứa mặc định
+        SELECT id INTO v_ct FROM container_type WHERE code =
+            CASE (SELECT item_type FROM item WHERE id = NEW.item_id)
+                WHEN 'PACKAGING'     THEN 'CARTON'
+                WHEN 'FINISHED_GOOD' THEN 'CARTON'
+                WHEN 'SEMI_FINISHED' THEN 'IBC'
+                ELSE 'DRUM' END;
+        INSERT INTO handling_unit(hu_no, container_type_id, item_id, lot_id, current_bin_id)
+        VALUES ('HU-'||lpad(nextval('hu_no_seq')::text, 4, '0'), v_ct, NEW.item_id, NEW.lot_id, NEW.bin_id)
+        RETURNING id INTO NEW.hu_id;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER trg_fill_hu BEFORE INSERT ON inventory_movement
+    FOR EACH ROW EXECUTE FUNCTION fn_fill_movement_hu();
+
+-- 6.5 VIEW
+-- 6.5.1 Tồn + thuộc tính theo TỪNG HU. qty_base = Σ ledger theo hu_id (nguồn sự thật).
+CREATE VIEW v_hu_stock AS
+SELECT hu.id AS hu_id, hu.hu_no, ct.code AS container_type, hu.item_id, hu.lot_id,
+       COALESCE((SELECT im.bin_id FROM inventory_movement im WHERE im.hu_id = hu.id
+        GROUP BY im.bin_id HAVING SUM(im.qty) > 0 ORDER BY SUM(im.qty) DESC LIMIT 1),
+        hu.current_bin_id) AS current_bin_id,   -- suy từ ledger (vị trí thực); pallet không ledger -> dùng cột lưu
+       hu.parent_hu_id, hu.status,
+       COALESCE(m.qty_base, 0)                              AS qty_base,
+       hu.tare_weight, hu.gross_weight,
+       (hu.gross_weight - hu.tare_weight)                   AS net_weight,
+       hu.opened_at,
+       (hu.opened_at::date + i.shelf_life_after_open_days)  AS expiry_after_open
+FROM handling_unit hu
+JOIN container_type ct ON ct.id = hu.container_type_id
+LEFT JOIN item i ON i.id = hu.item_id
+LEFT JOIN (SELECT hu_id, SUM(qty) AS qty_base FROM inventory_movement WHERE hu_id IS NOT NULL GROUP BY hu_id) m
+       ON m.hu_id = hu.id;
+
+-- 6.5.2 HU đang ở mỗi bin (vật lý ở đâu) — chỉ HU còn hàng.
+CREATE VIEW v_bin_hu AS
+SELECT s.current_bin_id AS bin_id, s.hu_id, s.hu_no, s.container_type, s.item_id, s.lot_id, s.qty_base, s.status
+FROM v_hu_stock s
+WHERE s.current_bin_id IS NOT NULL AND s.qty_base <> 0;
+
+-- 6.5.3 Cây pallet (HU cha -> con các cấp). Đệ quy, path-guard <20.
+CREATE VIEW v_hu_tree AS
+WITH RECURSIVE t AS (
+    SELECT id AS root_hu_id, id AS hu_id, parent_hu_id, 0 AS lvl, ARRAY[id] AS path
+    FROM handling_unit WHERE parent_hu_id IS NULL
+    UNION ALL
+    SELECT t.root_hu_id, h.id, h.parent_hu_id, t.lvl + 1, t.path || h.id
+    FROM handling_unit h JOIN t ON h.parent_hu_id = t.hu_id
+    WHERE NOT h.id = ANY (t.path) AND t.lvl < 20
+)
+SELECT root_hu_id, hu_id, parent_hu_id, lvl FROM t;
+
+-- 6.5.4 ĐỐI SOÁT (guard hồi quy): tồn theo (bin,item,lô) phần CÓ hu_id vs v_stock_on_hand. diff != 0 -> còn dòng thiếu HU (hoặc sai).
+CREATE VIEW v_hu_reconcile AS
+SELECT soh.bin_id, soh.item_id, soh.lot_id,
+       soh.qty_on_hand                          AS soh_qty,
+       COALESCE(huq.hu_qty, 0)                   AS hu_qty,
+       soh.qty_on_hand - COALESCE(huq.hu_qty, 0) AS diff
+FROM v_stock_on_hand soh
+LEFT JOIN (
+    SELECT bin_id, item_id, lot_id, SUM(qty) AS hu_qty
+    FROM inventory_movement WHERE hu_id IS NOT NULL
+    GROUP BY bin_id, item_id, lot_id
+) huq ON huq.bin_id = soh.bin_id AND huq.item_id = soh.item_id
+     AND huq.lot_id IS NOT DISTINCT FROM soh.lot_id;
+
+-- 6.5.5 HU đã MỞ NẮP + hạn sau mở (để cảnh báo dùng trước hết hạn).
+CREATE VIEW v_hu_expiring_after_open AS
+SELECT s.hu_id, s.hu_no, s.item_id, s.lot_id, s.opened_at, s.expiry_after_open, s.qty_base
+FROM v_hu_stock s
+WHERE s.opened_at IS NOT NULL AND s.qty_base <> 0;
+
+-- #############################################################################
+-- ##########################  HẾT ĐỢT 6  ######################################
 -- #############################################################################
 
 -- =============================================================================
