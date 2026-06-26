@@ -66,10 +66,18 @@ docker compose -f docker-compose.dev.yaml down -v && docker compose -f docker-co
   thực theo lô `fn_roll_lot_cost()` (CHỈ NVL).
 - **Đa đơn vị**: `uom.dimension`+`ratio_to_anchor`, `item_uom_conversion.factor_to_base`, `fn_to_base`, cột
   `*_base` + trigger (mục 11 của 004), view `v_item_valid_uom` (mục 11.5).
-- **Số chốt demo (007)**: SF-CREAM **61.4/kg**, FG-CREAM50 **6.27/cái**, tổng giá trị tồn **7860** (glycerin
-  base=g: 12500 g × 0.04). Đây là mốc đối chiếu hồi quy sau mỗi thay đổi.
-- **Đợt 5 (CHƯA làm — chỉ gợi ý nếu user hỏi)**: overhead/nhân công vào giá vốn; truyền định lượng genealogy
-  ĐA CẤP; tích hợp GL/kế toán; cấp phát lô SX tự động theo FEFO.
+- **Đợt 5a**: nhận hàng KHÔNG-PO (`receipt_source` walk_in/loan_return, `coa_status`); **cho mượn** nguyên liệu
+  đối tác ngoài (`material_loan`+`material_loan_line`, ledger `loan_out`/`loan_return`, `v_material_loan_status`).
+- **Đợt 5b**: **BÁN HÀNG** (khối 5b của 004) — `customer`, `sales_order(_line)`, `sales_shipment(_line)` (ledger
+  `sales_issue` + COGS theo lô), `sales_invoice(_line)` (VAT), `customer_payment`; view `v_sales_margin`,
+  `v_invoice_totals`, `v_ar_aging`, `v_so_line_fulfillment`. **loan→sale**: bán hàng đang-cho-mượn → dòng giao
+  `loan_line_id` + `from_bin_id NULL` → KHÔNG post ledger (hàng đã rời kho ở `loan_out`); `v_material_loan_status`
+  trừ thêm `sold_qty_base`. Bán chỉ ĐỌC giá lô → `fn_roll_lot_cost` KHÔNG đổi.
+- **Số chốt demo (007)**: SF-CREAM **61.4/kg**, FG-CREAM50 **6.27/cái**, glycerin **0.04/g** (mốc hồi quy giá vốn,
+  BẤT BIẾN). Tổng giá trị **tồn kho = 7643** sau Bước 10 (bán 100 hộp FG: −627 COGS; loan→sale không động kho).
+  Công nợ phải thu demo: Z 1160 + XYZ 108.
+- **Đợt 5 (còn lại — chỉ gợi ý nếu user hỏi)**: overhead/nhân công vào giá vốn; truyền định lượng genealogy ĐA
+  CẤP; cấp phát lô SX tự động theo FEFO; GL kế toán nâng cao (double-entry, trả hàng bán, bảng giá).
 
 ## 6. Chạy tiếp "context" ở máy khác
 - File này (`CLAUDE.md`) **tự nạp** khi mở repo bằng Claude Code → có ngay ngữ cảnh.

@@ -25,14 +25,17 @@
 CREATE TYPE pr_status      AS ENUM ('draft','submitted','approved','rejected','converted','cancelled');
 CREATE TYPE po_status      AS ENUM ('draft','sent','confirmed','partially_received','received','closed','cancelled');
 CREATE TYPE receipt_status AS ENUM ('draft','posted','cancelled');
+CREATE TYPE receipt_source AS ENUM ('purchase_order','walk_in','loan_return');  -- nguồn phiếu nhận: theo PO / xách tay / nhận hàng cho mượn trả về
 CREATE TYPE qc_status      AS ENUM ('quarantine','approved','rejected','on_hold'); -- cách ly / đạt / loại / tạm giữ
+CREATE TYPE coa_status     AS ENUM ('not_required','missing','mismatch','matched'); -- COA: ko yêu cầu / thiếu / có nhưng sai / đúng
 CREATE TYPE weight_source  AS ENUM ('weighed_full','weighed_sample','declared');  -- cân toàn bộ / cân mẫu / theo phiếu
 
 CREATE TYPE item_type      AS ENUM ('RAW_MATERIAL','PACKAGING','FINISHED_GOOD','SEMI_FINISHED','SOLVENT');
 CREATE TYPE zone_type      AS ENUM ('RAW_MATERIAL','PACKAGING','FINISHED_GOODS','SOLVENT');
 CREATE TYPE bin_type       AS ENUM ('TEMPORARY','PRESERVATION','DISPOSAL','RETURNS'); -- Tạm trữ/Bảo quản/Loại bỏ/Hàng trả về
 CREATE TYPE movement_type  AS ENUM ('receipt','transfer','qc_release','issue','adjustment','return',
-                                   'production_issue','production_receipt'); -- đợt 3: xuất NVL cho SX / nhập thành phẩm
+                                   'production_issue','production_receipt',
+                                   'loan_out','loan_return','sales_issue'); -- đợt 3: xuất NVL SX/nhập TP; đợt 5a: cho mượn/nhận lại; đợt 5b: xuất bán
 
 -- =============================================================================
 -- 1. DANH MỤC (MASTER DATA)
@@ -247,16 +250,20 @@ CREATE INDEX idx_lot_qc   ON lot(qc_status);
 CREATE TABLE goods_receipt (
     id             bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     gr_no          varchar(30)    NOT NULL UNIQUE,         -- GR-2026-0001
-    po_id          bigint         NOT NULL REFERENCES purchase_order(id),
-    supplier_id    bigint         NOT NULL REFERENCES supplier(id),
+    receipt_source receipt_source NOT NULL DEFAULT 'purchase_order', -- theo PO / mua xách tay (walk_in)
+    po_id          bigint         REFERENCES purchase_order(id),      -- NULL khi mua xách tay
+    supplier_id    bigint         REFERENCES supplier(id),            -- NULL khi không có NCC (xách tay)
+    source_note    text,                                  -- nguồn hàng khi không-PO (ai mang về / mua ở đâu)
     location_id    bigint         NOT NULL REFERENCES location(id),   -- nhận về site nào
     received_by    uuid           REFERENCES users(id),               -- thủ kho nhận
     receipt_date   date           NOT NULL DEFAULT current_date,
-    supplier_do_no varchar(50),                            -- số phiếu xuất kho/giao hàng bên bán
+    supplier_do_no varchar(50),                            -- số phiếu giao hàng bên bán (có giá trị = có phiếu giao)
     status         receipt_status NOT NULL DEFAULT 'draft',
     note           text,
     created_at     timestamptz    NOT NULL DEFAULT now(),
-    updated_at     timestamptz    NOT NULL DEFAULT now()
+    updated_at     timestamptz    NOT NULL DEFAULT now(),
+    -- phiếu theo PO bắt buộc có po_id; phiếu xách tay (walk_in) bắt buộc po_id NULL
+    CONSTRAINT chk_gr_source_po CHECK ((receipt_source = 'purchase_order') = (po_id IS NOT NULL))
 );
 CREATE INDEX idx_gr_po       ON goods_receipt(po_id);
 CREATE INDEX idx_gr_supplier ON goods_receipt(supplier_id);
@@ -264,7 +271,7 @@ CREATE INDEX idx_gr_supplier ON goods_receipt(supplier_id);
 CREATE TABLE goods_receipt_line (
     id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     gr_id         bigint        NOT NULL REFERENCES goods_receipt(id) ON DELETE CASCADE,
-    po_line_id    bigint        NOT NULL REFERENCES purchase_order_line(id), -- nhận cho dòng PO nào
+    po_line_id    bigint        REFERENCES purchase_order_line(id), -- NULL khi nhận KHÔNG qua PO (xách tay)
     item_id       bigint        NOT NULL REFERENCES item(id),
     lot_id        bigint        REFERENCES lot(id),        -- lô được tạo/gán khi nhập
     to_bin_id     bigint        REFERENCES storage_bin(id),-- bin nhận ban đầu (NVL: bin Tạm trữ/cách ly)
@@ -284,6 +291,8 @@ CREATE TABLE goods_receipt_line (
     -- (c) Giá & QC
     unit_price    numeric(18,4) NOT NULL DEFAULT 0,        -- giá THEO đơn vị qty_uom_id (giá vốn tạm tính)
     qc_status     qc_status     NOT NULL DEFAULT 'quarantine',
+    coa_status    coa_status    NOT NULL DEFAULT 'not_required', -- thủ kho đối chiếu COA: ko yêu cầu/thiếu/có nhưng sai/đúng
+    coa_no        varchar(50),                             -- số COA kèm theo (nếu có)
     note          text
 );
 CREATE INDEX idx_grl_gr     ON goods_receipt_line(gr_id);
@@ -374,6 +383,7 @@ CREATE VIEW v_receipt_variance AS
 SELECT
     grl.id                                                    AS gr_line_id,
     gr.gr_no,
+    gr.receipt_source,
     grl.declared_qty,
     grl.received_qty,
     grl.received_qty - grl.declared_qty                       AS qty_diff,
@@ -386,7 +396,7 @@ SELECT
          THEN true ELSE false END                             AS out_of_tolerance
 FROM goods_receipt_line grl
 JOIN goods_receipt   gr ON gr.id = grl.gr_id
-JOIN purchase_order  po ON po.id = gr.po_id;
+LEFT JOIN purchase_order po ON po.id = gr.po_id;   -- LEFT: phiếu xách tay (walk_in) không có PO -> tolerance NULL
 
 -- 9.3 Tồn hiện có theo (bin, item, lô) — cộng dồn ledger.
 CREATE VIEW v_stock_on_hand AS
@@ -1041,10 +1051,13 @@ BEGIN
     CREATE TEMP TABLE _lc(lot_id bigint PRIMARY KEY, unit_cost numeric(18,6)) ON COMMIT DROP;
 
     -- 1. lô MUA: giá vốn / ĐƠN VỊ BASE = Σ(tiền) / Σ(số lượng base). (unit_price theo đơn vị nhập)
+    --    Loại phiếu 'loan_return' (hàng cho mượn TRẢ VỀ không phải mua -> không pha loãng giá vốn).
     INSERT INTO _lc(lot_id, unit_cost)
     SELECT grl.lot_id, SUM(grl.received_qty * grl.unit_price) / SUM(grl.received_qty_base)
     FROM goods_receipt_line grl
+    JOIN goods_receipt gr ON gr.id = grl.gr_id
     WHERE grl.lot_id IS NOT NULL
+      AND gr.receipt_source <> 'loan_return'
     GROUP BY grl.lot_id
     HAVING SUM(grl.received_qty_base) > 0;
 
@@ -1120,6 +1133,334 @@ LEFT JOIN (
     WHERE pr.status = 'posted'
     GROUP BY pr.mo_id
 ) outp ON outp.mo_id = mo.id;
+
+-- #############################################################################
+-- ##########################  PHẦN ĐỢT 5a  ####################################
+-- CHO MƯỢN NGUYÊN LIỆU cho đối tác NGOÀI -> theo dõi công nợ vật tư -> NHẬN LẠI.
+--   Cho mượn = xuất vật tư APPROVED khỏi tồn (ledger loan_out, vật tư rời kho mình).
+--   Nhận lại = goods_receipt receipt_source='loan_return' (không PO), link về khoản mượn.
+--   Đặt TRƯỚC mục 10 để vòng lặp tự gắn audit + updated_at cho bảng mới.
+-- #############################################################################
+CREATE TYPE loan_status AS ENUM ('open','closed','cancelled');  -- còn cho mượn / đã tất toán / huỷ
+
+CREATE TABLE material_loan (
+    id                   bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    loan_no              varchar(30)  NOT NULL UNIQUE,                  -- ML-2026-0001
+    borrower_name        varchar(150) NOT NULL,                        -- đối tác NGOÀI mượn (free text -> group "ai chưa trả")
+    borrower_contact     varchar(100),                                 -- người/SĐT liên hệ
+    location_id          bigint       NOT NULL REFERENCES location(id),-- xuất từ site nào
+    loan_date            date         NOT NULL DEFAULT current_date,
+    expected_return_date date,                                         -- hẹn trả
+    status               loan_status  NOT NULL DEFAULT 'open',
+    issued_by            uuid         REFERENCES users(id),            -- người cho mượn
+    note                 text,
+    created_at           timestamptz  NOT NULL DEFAULT now(),
+    updated_at           timestamptz  NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_loan_borrower ON material_loan(borrower_name);
+
+CREATE TABLE material_loan_line (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    loan_id     bigint        NOT NULL REFERENCES material_loan(id) ON DELETE CASCADE,
+    item_id     bigint        NOT NULL REFERENCES item(id),
+    lot_id      bigint        NOT NULL REFERENCES lot(id),             -- lô đang tồn đem cho mượn
+    from_bin_id bigint        NOT NULL REFERENCES storage_bin(id),     -- xuất từ bin Bảo quản (khả dụng)
+    qty         numeric(18,4) NOT NULL CHECK (qty > 0),                -- ở đơn vị uom_id
+    uom_id      bigint        NOT NULL REFERENCES uom(id),
+    qty_base    numeric(18,6),                                         -- trigger tự điền (= fn_to_base)
+    note        text
+);
+CREATE INDEX idx_loanline_loan ON material_loan_line(loan_id);
+CREATE INDEX idx_loanline_lot  ON material_loan_line(lot_id);
+
+-- Liên kết PHIẾU NHẬN TRẢ (goods_receipt) với khoản cho mượn (ALTER vì trỏ bảng vừa tạo).
+ALTER TABLE goods_receipt
+    ADD COLUMN loan_id bigint REFERENCES material_loan(id),                        -- phiếu nhận trả thuộc khoản mượn nào
+    ADD CONSTRAINT chk_gr_loan CHECK (loan_id IS NULL OR receipt_source = 'loan_return'); -- loan_id chỉ cho phiếu loan_return
+ALTER TABLE goods_receipt_line
+    ADD COLUMN loan_line_id bigint REFERENCES material_loan_line(id);              -- dòng trả cho dòng cho-mượn nào (đối chiếu SL)
+CREATE INDEX idx_grl_loanline ON goods_receipt_line(loan_line_id);
+
+-- ĐỐI CHIẾU cho mượn (đã trả / còn nợ / giá trị): view v_material_loan_status được ĐỊNH NGHĨA Ở ĐỢT 5b
+--   (mục 5b.9.5) — vì nay outstanding còn trừ thêm phần ĐÃ BÁN (loan→sale), cần bảng sales_shipment_line tạo sau.
+
+-- #############################################################################
+-- ##########################  HẾT ĐỢT 5a  #####################################
+-- #############################################################################
+
+-- #############################################################################
+-- ##########################  ĐỢT 5b — BÁN HÀNG (SALES)  ######################
+-- #  Khách hàng -> đơn bán -> giao hàng (XUẤT KHO + COGS) -> hoá đơn (VAT) ->  #
+-- #  thu tiền -> công nợ phải thu (AR aging). MIRROR module mua hàng.          #
+-- #  Nhánh đặc biệt: BÁN hàng đang-cho-mượn (loan->sale) KHÔNG xuất kho lần    #
+-- #  nữa (hàng đã rời kho ở loan_out) — chỉ ghi doanh thu/COGS + đóng công nợ. #
+-- #############################################################################
+
+-- 5b.0 Enum trạng thái bán hàng (mirror po_status / receipt_status).
+CREATE TYPE so_status      AS ENUM ('draft','confirmed','partially_shipped','shipped','closed','cancelled');
+CREATE TYPE invoice_status AS ENUM ('draft','issued','partially_paid','paid','cancelled');
+
+-- 5b.1 Khách hàng (mirror supplier) — master data, KHÔNG updated_at (vẫn được audit ở mục 10).
+CREATE TABLE customer (
+    id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    code          varchar(30)  NOT NULL UNIQUE,
+    name          varchar(255) NOT NULL,
+    tax_code      varchar(20),
+    payment_terms varchar(150),                           -- mô tả điều khoản (vd "Công nợ 30 ngày")
+    credit_days   integer      NOT NULL DEFAULT 0,        -- hạn công nợ (ngày) -> tính due_date hoá đơn
+    credit_limit  numeric(18,2),                          -- hạn mức công nợ (NULL = không giới hạn)
+    address       text,
+    phone         varchar(30),
+    is_active     boolean      NOT NULL DEFAULT true,
+    created_at    timestamptz  NOT NULL DEFAULT now()
+);
+
+-- 5b.2 Đơn bán hàng (mirror purchase_order).
+CREATE TABLE sales_order (
+    id                 bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    so_no              varchar(30)  NOT NULL UNIQUE,       -- SO-2026-0001
+    customer_id        bigint       NOT NULL REFERENCES customer(id),
+    order_date         date         NOT NULL DEFAULT current_date,
+    currency           varchar(3)   NOT NULL DEFAULT 'VND',
+    status             so_status    NOT NULL DEFAULT 'draft',
+    created_by         uuid         REFERENCES users(id),  -- nhân viên bán hàng (RBAC)
+    approved_by        uuid         REFERENCES users(id),
+    expected_ship_date date,
+    note               text,
+    created_at         timestamptz  NOT NULL DEFAULT now(),
+    updated_at         timestamptz  NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_so_customer ON sales_order(customer_id);
+
+-- 5b.3 Dòng đơn bán (mirror purchase_order_line) — ⚠️ có cột generated line_amount.
+CREATE TABLE sales_order_line (
+    id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    so_id         bigint        NOT NULL REFERENCES sales_order(id) ON DELETE CASCADE,
+    item_id       bigint        NOT NULL REFERENCES item(id),
+    ordered_qty   numeric(18,4) NOT NULL CHECK (ordered_qty > 0),         -- ở đơn vị uom_id
+    uom_id        bigint        NOT NULL REFERENCES uom(id),
+    ordered_qty_base numeric(18,6),                                       -- quy về base — trigger fn_fill_sol_base
+    unit_price    numeric(18,4) NOT NULL CHECK (unit_price >= 0),         -- giá bán THEO uom_id
+    line_amount   numeric(18,2) GENERATED ALWAYS AS (ordered_qty * unit_price) STORED,
+    note          text
+);
+CREATE INDEX idx_sol_so   ON sales_order_line(so_id);
+CREATE INDEX idx_sol_item ON sales_order_line(item_id);
+
+-- 5b.4 Phiếu giao hàng / xuất bán (mirror goods_receipt header, chiều XUẤT). Nơi tồn RỜI kho + ghi COGS.
+CREATE TABLE sales_shipment (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    shipment_no varchar(30)    NOT NULL UNIQUE,            -- DO-2026-0001 (delivery order)
+    so_id       bigint         REFERENCES sales_order(id),   -- NULL: bán trực tiếp / loan->sale không qua SO
+    customer_id bigint         NOT NULL REFERENCES customer(id),
+    location_id bigint         NOT NULL REFERENCES location(id),  -- xuất từ site nào
+    shipped_by  uuid           REFERENCES users(id),
+    ship_date   date           NOT NULL DEFAULT current_date,
+    status      receipt_status NOT NULL DEFAULT 'draft',   -- tái dùng draft/posted/cancelled
+    loan_id     bigint         REFERENCES material_loan(id), -- nếu BÁN hàng đang cho mượn (loan->sale)
+    note        text,
+    created_at  timestamptz    NOT NULL DEFAULT now(),
+    updated_at  timestamptz    NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_ship_customer ON sales_shipment(customer_id);
+CREATE INDEX idx_ship_so       ON sales_shipment(so_id);
+
+-- 5b.5 Dòng giao hàng (mirror goods_receipt_line, gọn).
+--   Bán THƯỜNG : from_bin_id (bin Bảo quản) -> app post ledger 'sales_issue' (-).
+--   loan->sale : loan_line_id set, from_bin_id NULL -> KHÔNG post ledger (hàng đã rời kho ở loan_out).
+CREATE TABLE sales_shipment_line (
+    id               bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    shipment_id      bigint        NOT NULL REFERENCES sales_shipment(id) ON DELETE CASCADE,
+    so_line_id       bigint        REFERENCES sales_order_line(id),       -- NULL: bán trực tiếp / loan->sale
+    item_id          bigint        NOT NULL REFERENCES item(id),
+    lot_id           bigint        REFERENCES lot(id),                    -- lô xuất -> COGS theo lô
+    from_bin_id      bigint        REFERENCES storage_bin(id),            -- bin Bảo quản; NULL khi loan->sale
+    shipped_qty      numeric(18,4) NOT NULL CHECK (shipped_qty > 0),      -- ở đơn vị uom_id
+    uom_id           bigint        NOT NULL REFERENCES uom(id),
+    shipped_qty_base numeric(18,6),                                       -- quy về base — trigger fn_fill_qty_base
+    unit_price       numeric(18,4) NOT NULL DEFAULT 0,                    -- giá bán (doanh thu / lập hoá đơn)
+    loan_line_id     bigint        REFERENCES material_loan_line(id),     -- nếu BÁN hàng đang cho mượn
+    note             text,
+    -- bán thường: có from_bin & không loan; loan->sale: có loan & không from_bin (đúng 1 trong 2).
+    CONSTRAINT chk_ssl_source CHECK (num_nonnulls(from_bin_id, loan_line_id) = 1)
+);
+CREATE INDEX idx_ssl_ship ON sales_shipment_line(shipment_id);
+CREATE INDEX idx_ssl_item ON sales_shipment_line(item_id);
+CREATE INDEX idx_ssl_lot  ON sales_shipment_line(lot_id);
+CREATE INDEX idx_ssl_loan ON sales_shipment_line(loan_line_id);
+
+-- 5b.6 Hoá đơn bán (VAT). 1 hoá đơn có thể gộp nhiều phiếu giao.
+CREATE TABLE sales_invoice (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    invoice_no   varchar(30)    NOT NULL UNIQUE,           -- INV-2026-0001
+    customer_id  bigint         NOT NULL REFERENCES customer(id),
+    invoice_date date           NOT NULL DEFAULT current_date,
+    due_date     date,                                     -- = invoice_date + customer.credit_days
+    currency     varchar(3)     NOT NULL DEFAULT 'VND',
+    tax_rate     numeric(5,2)   NOT NULL DEFAULT 8.0,      -- % VAT (VN: 8 hoặc 10)
+    status       invoice_status NOT NULL DEFAULT 'draft',
+    created_by   uuid           REFERENCES users(id),
+    note         text,
+    created_at   timestamptz    NOT NULL DEFAULT now(),
+    updated_at   timestamptz    NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_inv_customer ON sales_invoice(customer_id);
+
+-- 5b.7 Dòng hoá đơn (money-only: KHÔNG cột base, KHÔNG trigger). Trỏ về dòng giao đã xuất hoá đơn.
+CREATE TABLE sales_invoice_line (
+    id               bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    invoice_id       bigint        NOT NULL REFERENCES sales_invoice(id) ON DELETE CASCADE,
+    shipment_line_id bigint        REFERENCES sales_shipment_line(id),    -- dòng giao được xuất hoá đơn
+    item_id          bigint        NOT NULL REFERENCES item(id),
+    qty              numeric(18,4) NOT NULL CHECK (qty > 0),
+    uom_id           bigint        NOT NULL REFERENCES uom(id),
+    unit_price       numeric(18,4) NOT NULL CHECK (unit_price >= 0),
+    line_net         numeric(18,2) GENERATED ALWAYS AS (qty * unit_price) STORED,  -- tiền TRƯỚC thuế
+    note             text
+);
+CREATE INDEX idx_invl_invoice ON sales_invoice_line(invoice_id);
+
+-- 5b.8 Thu tiền khách (AR). invoice_id NULL = trả trước/treo.
+CREATE TABLE customer_payment (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    payment_no   varchar(30)   NOT NULL UNIQUE,            -- PAY-2026-0001
+    customer_id  bigint        NOT NULL REFERENCES customer(id),
+    invoice_id   bigint        REFERENCES sales_invoice(id),
+    payment_date date          NOT NULL DEFAULT current_date,
+    amount       numeric(18,2) NOT NULL CHECK (amount > 0),
+    method       varchar(30),                              -- 'cash' / 'bank' / ...
+    received_by  uuid          REFERENCES users(id),
+    note         text,
+    created_at   timestamptz   NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_pay_customer ON customer_payment(customer_id);
+CREATE INDEX idx_pay_invoice  ON customer_payment(invoice_id);
+
+-- 5b.9 VIEW
+-- 5b.9.1 Tiến độ giao theo dòng SO (mirror v_po_line_progress) — đặt vs đã giao (so ở BASE).
+CREATE VIEW v_so_line_fulfillment AS
+SELECT
+    sol.id                                                         AS so_line_id,
+    sol.so_id,
+    sol.item_id,
+    sol.uom_id,
+    sol.ordered_qty,
+    sol.ordered_qty_base,
+    COALESCE(SUM(ssl.shipped_qty_base), 0)                         AS shipped_qty_base,
+    sol.ordered_qty_base - COALESCE(SUM(ssl.shipped_qty_base), 0)  AS open_qty
+FROM sales_order_line sol
+LEFT JOIN sales_shipment_line ssl ON ssl.so_line_id = sol.id
+LEFT JOIN sales_shipment      ss  ON ss.id = ssl.shipment_id AND ss.status = 'posted'
+GROUP BY sol.id;
+
+-- 5b.9.2 Lãi gộp theo dòng giao đã post: doanh thu (giá bán) − giá vốn (lot.unit_cost). COGS chỉ ĐỌC giá lô.
+CREATE VIEW v_sales_margin AS
+SELECT
+    ssl.id                                              AS shipment_line_id,
+    ss.id                                               AS shipment_id,
+    ss.shipment_no,
+    ss.customer_id,
+    ssl.item_id,
+    ssl.lot_id,
+    ssl.shipped_qty,
+    ssl.shipped_qty_base,
+    ssl.unit_price,
+    ssl.shipped_qty * ssl.unit_price                                                  AS revenue,
+    ssl.shipped_qty_base * COALESCE(l.unit_cost, 0)                                    AS cogs,
+    ssl.shipped_qty * ssl.unit_price - ssl.shipped_qty_base * COALESCE(l.unit_cost, 0) AS margin
+FROM sales_shipment_line ssl
+JOIN sales_shipment ss ON ss.id = ssl.shipment_id
+LEFT JOIN lot l ON l.id = ssl.lot_id
+WHERE ss.status = 'posted';
+
+-- 5b.9.3 Tổng tiền hoá đơn: net (trước thuế) / thuế VAT / gross (sau thuế).
+CREATE VIEW v_invoice_totals AS
+SELECT
+    si.id            AS invoice_id,
+    si.invoice_no,
+    si.customer_id,
+    si.invoice_date,
+    si.due_date,
+    si.status,
+    si.tax_rate,
+    COALESCE(SUM(sil.line_net), 0)                                   AS net_amount,
+    ROUND(COALESCE(SUM(sil.line_net), 0) * si.tax_rate / 100, 2)     AS tax_amount,
+    COALESCE(SUM(sil.line_net), 0)
+      + ROUND(COALESCE(SUM(sil.line_net), 0) * si.tax_rate / 100, 2) AS gross_amount
+FROM sales_invoice si
+LEFT JOIN sales_invoice_line sil ON sil.invoice_id = si.id
+GROUP BY si.id;
+
+-- 5b.9.4 Công nợ phải thu theo TUỔI NỢ (AR aging). "Ai nợ tiền" = GROUP customer HAVING Σoutstanding>0.
+CREATE VIEW v_ar_aging AS
+SELECT
+    it.invoice_id,
+    it.invoice_no,
+    it.customer_id,
+    c.name                                       AS customer_name,
+    it.invoice_date,
+    it.due_date,
+    it.gross_amount,
+    COALESCE(pay.paid, 0)                        AS paid_amount,
+    it.gross_amount - COALESCE(pay.paid, 0)      AS outstanding_amount,
+    (current_date - it.due_date)                 AS days_overdue,
+    CASE
+        WHEN it.due_date IS NULL OR current_date <= it.due_date THEN 'current'
+        WHEN current_date - it.due_date <= 30 THEN '1-30'
+        WHEN current_date - it.due_date <= 60 THEN '31-60'
+        WHEN current_date - it.due_date <= 90 THEN '61-90'
+        ELSE '90+'
+    END                                          AS aging_bucket
+FROM v_invoice_totals it
+JOIN customer c ON c.id = it.customer_id
+LEFT JOIN (
+    SELECT invoice_id, SUM(amount) AS paid
+    FROM customer_payment
+    WHERE invoice_id IS NOT NULL
+    GROUP BY invoice_id
+) pay ON pay.invoice_id = it.invoice_id
+WHERE it.status <> 'cancelled';
+
+-- 5b.9.5 (CHUYỂN từ đợt 5a xuống) Trạng thái cho mượn — NAY trừ thêm phần ĐÃ BÁN (loan->sale).
+--   outstanding = đã mượn − đã trả (goods_receipt loan_return) − đã bán (sales_shipment loan->sale).
+--   Dùng subquery TIỀN-GỘP cho returns & sales để tránh nhân dòng (fan-out) khi 1 dòng mượn có cả 2 nguồn.
+CREATE VIEW v_material_loan_status AS
+SELECT
+    ml.id                AS loan_id,
+    ml.loan_no,
+    ml.borrower_name,
+    ml.loan_date,
+    ml.expected_return_date,
+    ml.status,
+    mll.id               AS loan_line_id,
+    mll.item_id,
+    mll.lot_id,
+    mll.qty_base                                                                    AS lent_qty_base,
+    COALESCE(r.returned_qty_base, 0)                                                AS returned_qty_base,
+    COALESCE(s.sold_qty_base, 0)                                                    AS sold_qty_base,
+    mll.qty_base - COALESCE(r.returned_qty_base, 0) - COALESCE(s.sold_qty_base, 0)  AS outstanding_qty_base,
+    (mll.qty_base - COALESCE(r.returned_qty_base, 0) - COALESCE(s.sold_qty_base, 0)) * l.unit_cost AS outstanding_value
+FROM material_loan ml
+JOIN material_loan_line mll ON mll.loan_id = ml.id
+JOIN lot l ON l.id = mll.lot_id
+LEFT JOIN (
+    SELECT grl.loan_line_id, SUM(grl.received_qty_base) AS returned_qty_base
+    FROM goods_receipt_line grl
+    JOIN goods_receipt gr ON gr.id = grl.gr_id
+    WHERE gr.status = 'posted' AND grl.loan_line_id IS NOT NULL
+    GROUP BY grl.loan_line_id
+) r ON r.loan_line_id = mll.id
+LEFT JOIN (
+    SELECT ssl.loan_line_id, SUM(ssl.shipped_qty_base) AS sold_qty_base
+    FROM sales_shipment_line ssl
+    JOIN sales_shipment ss ON ss.id = ssl.shipment_id
+    WHERE ss.status = 'posted' AND ssl.loan_line_id IS NOT NULL
+    GROUP BY ssl.loan_line_id
+) s ON s.loan_line_id = mll.id;
+
+-- #############################################################################
+-- ##########################  HẾT ĐỢT 5b  #####################################
+-- #############################################################################
 
 -- =============================================================================
 -- 10. TÍCH HỢP TRIGGER CỦA CORE (002) CHO BẢNG ERP
@@ -1226,6 +1567,8 @@ CREATE TRIGGER trg_qtybase BEFORE INSERT OR UPDATE ON purchase_requisition_line
     FOR EACH ROW EXECUTE FUNCTION fn_fill_qty_base('item_id','qty','uom_id','qty_base');
 CREATE TRIGGER trg_qtybase BEFORE INSERT OR UPDATE ON material_issue_line
     FOR EACH ROW EXECUTE FUNCTION fn_fill_qty_base('component_item_id','qty','uom_id','qty_base');
+CREATE TRIGGER trg_qtybase BEFORE INSERT OR UPDATE ON material_loan_line
+    FOR EACH ROW EXECUTE FUNCTION fn_fill_qty_base('item_id','qty','uom_id','qty_base');
 
 -- 11.2 purchase_order_line — có cột generated line_amount -> dùng trigger riêng (gán trực tiếp).
 CREATE OR REPLACE FUNCTION fn_fill_pol_base() RETURNS trigger LANGUAGE plpgsql AS
@@ -1286,6 +1629,24 @@ FROM item_uom_conversion c
 JOIN uom u  ON u.id = c.uom_id
 JOIN item i ON i.id = c.item_id
 WHERE c.uom_id <> i.base_uom_id;     -- tránh trùng dòng base nếu lỡ khai base vào conversion
+
+-- 11.6 BÁN HÀNG (ĐỢT 5b)
+-- sales_order_line — có cột generated line_amount -> hàm riêng (gán trực tiếp, như fn_fill_pol_base).
+CREATE OR REPLACE FUNCTION fn_fill_sol_base() RETURNS trigger LANGUAGE plpgsql AS
+$$
+BEGIN
+    IF NEW.item_id IS NOT NULL AND NEW.ordered_qty IS NOT NULL AND NEW.uom_id IS NOT NULL THEN
+        NEW.ordered_qty_base := fn_to_base(NEW.item_id, NEW.ordered_qty, NEW.uom_id);
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER trg_qtybase BEFORE INSERT OR UPDATE ON sales_order_line
+    FOR EACH ROW EXECUTE FUNCTION fn_fill_sol_base();
+-- sales_shipment_line — KHÔNG có cột generated -> dùng generic fn_fill_qty_base.
+CREATE TRIGGER trg_qtybase BEFORE INSERT OR UPDATE ON sales_shipment_line
+    FOR EACH ROW EXECUTE FUNCTION fn_fill_qty_base('item_id','shipped_qty','uom_id','shipped_qty_base');
+-- sales_invoice_line: KHÔNG trigger (money-only, không có cột base).
 
 -- =============================================================================
 -- TRẠNG THÁI & GIỚI HẠN ĐÃ BIẾT

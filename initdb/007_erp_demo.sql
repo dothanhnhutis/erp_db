@@ -28,6 +28,14 @@ DECLARE
     v_po_gly   bigint;   -- PO riêng cho glycerin (minh hoạ mua kg)
     v_gr_gly   bigint;   -- GR riêng cho glycerin (minh hoạ nhận thùng)
     v_lot_gly  bigint;
+    v_gr_walk  bigint;   -- phiếu nhận XÁCH TAY (không PO)
+    v_lot_cart bigint;   -- lô PK-CARTON xách tay (thủ kho duyệt ĐẠT)
+    v_lot_btl  bigint;   -- lô PK-BOTTLE100 xách tay (thủ kho LOẠI -> tạm trữ)
+    v_lot_eth  bigint;   -- lô SOL-ETHANOL xách tay (COA sai -> QC/QA)
+    v_loan      bigint;  -- khoản cho mượn (đối tác ngoài)
+    v_loan_line bigint;  -- dòng cho mượn glycerin
+    v_gr_ret    bigint;  -- phiếu nhận trả (loan_return)
+    v_bin_gly   bigint;  -- bin Bảo quản của glycerin
     v_mo_sf    bigint;
     v_mo_fg    bigint;
     v_mi       bigint;
@@ -36,6 +44,18 @@ DECLARE
     v_lot_fg   bigint;
     v_n_mo     int;
     v_fg_cost  numeric;
+    -- ĐỢT 5b — bán hàng
+    v_cust_z         bigint := (SELECT id FROM customer WHERE code='CUST-Z');
+    v_cust_xyz       bigint := (SELECT id FROM customer WHERE code='CUST-XYZ');
+    v_bin_fg         bigint;   -- bin Bảo quản thành phẩm FG-CREAM50
+    v_so             bigint;   -- đơn bán
+    v_so_line        bigint;
+    v_ship           bigint;   -- phiếu giao bán thường
+    v_ship_line      bigint;
+    v_ship_loan      bigint;   -- phiếu giao bán hàng cho-mượn (loan->sale)
+    v_ship_line_loan bigint;
+    v_inv_z          bigint;   -- hoá đơn CUST-Z
+    v_inv_xyz        bigint;   -- hoá đơn CUST-XYZ (loan->sale)
 BEGIN
     -- Bảng tra cứu tạm: bin Tạm trữ (TT) & Bảo quản (BQ) theo KHU của từng item.
     --   item_type -> zone_type: RAW_MATERIAL->ZRM, PACKAGING->ZPK, SOLVENT->ZSOL,
@@ -212,6 +232,54 @@ BEGIN
     FROM goods_receipt_line grl JOIN _bin bn ON bn.item_id=grl.item_id WHERE grl.gr_id = v_gr_gly;
     RAISE NOTICE 'Bước 5b: Glycerin base=g — đặt 20 kg, nhận 1 thùng -> tồn 20000 g (tiêu hao 7500 g khi SX bulk).';
 
+    -- 5h. NHẬN HÀNG KHÔNG QUA PO (mua xách tay) — po_id/po_line_id/supplier_id = NULL, receipt_source='walk_in'.
+    --     + Hàng KHÔNG cần QC: thủ kho duyệt ngay — ĐẠT -> Bảo quản (khả dụng); KHÔNG đạt -> Tạm trữ (chờ trả/bỏ).
+    --     + Hàng CẦN QC (hoá chất): đối chiếu COA lúc nhận (đúng/sai vẫn nhận Tạm trữ) -> QC/QA kiểm -> Bảo quản.
+    --     Dùng PK-CARTON / PK-BOTTLE100 / SOL-ETHANOL (KHÔNG thuộc BOM kem) + lô '…-WALK' để tách khỏi luồng SX.
+    INSERT INTO goods_receipt(gr_no, receipt_source, po_id, supplier_id, source_note, location_id, received_by, status)
+    VALUES ('GR-WALK-01', 'walk_in', NULL, NULL, 'Mua xách tay tại cửa hàng vật tư — NV mua hàng mang về',
+            v_loc, v_admin, 'posted')
+    RETURNING id INTO v_gr_walk;
+
+    INSERT INTO lot(lot_no, item_id, qc_status, manufacture_date)
+    VALUES ('L-PK-CARTON-WALK',    (SELECT id FROM item WHERE code='PK-CARTON'),    'approved',   current_date) RETURNING id INTO v_lot_cart;
+    INSERT INTO lot(lot_no, item_id, qc_status, manufacture_date)
+    VALUES ('L-PK-BOTTLE100-WALK', (SELECT id FROM item WHERE code='PK-BOTTLE100'), 'on_hold',    current_date) RETURNING id INTO v_lot_btl;
+    INSERT INTO lot(lot_no, item_id, qc_status, manufacture_date)
+    VALUES ('L-SOL-ETHANOL-WALK',  (SELECT id FROM item WHERE code='SOL-ETHANOL'),  'quarantine', current_date) RETURNING id INTO v_lot_eth;
+
+    INSERT INTO goods_receipt_line(gr_id, po_line_id, item_id, lot_id, to_bin_id,
+                                   declared_qty, received_qty, qty_uom_id, unit_price, qc_status, coa_status, note)
+    VALUES
+      (v_gr_walk, NULL, (SELECT id FROM item WHERE code='PK-CARTON'), v_lot_cart,
+       (SELECT bq_bin FROM _bin WHERE item_id=(SELECT id FROM item WHERE code='PK-CARTON')),
+       50, 50, v_cai, 3.0, 'approved',   'not_required', 'Thủ kho duyệt: thùng carton đạt -> nhập kho'),
+      (v_gr_walk, NULL, (SELECT id FROM item WHERE code='PK-BOTTLE100'), v_lot_btl,
+       (SELECT tt_bin FROM _bin WHERE item_id=(SELECT id FROM item WHERE code='PK-BOTTLE100')),
+       20, 20, v_cai, 2.0, 'on_hold',    'not_required', 'Thủ kho: chai trầy xước -> tạm trữ chờ trả'),
+      (v_gr_walk, NULL, (SELECT id FROM item WHERE code='SOL-ETHANOL'), v_lot_eth,
+       (SELECT tt_bin FROM _bin WHERE item_id=(SELECT id FROM item WHERE code='SOL-ETHANOL')),
+       10, 10, v_kg,  30,  'quarantine', 'mismatch',     'COA không khớp số lô -> đã báo NCC, vẫn nhận tạm trữ chờ QC');
+
+    -- Ledger NHẬP (+) vào bin của từng dòng (theo BASE). Cả 3 đều ghi nhận tồn vật lý.
+    INSERT INTO inventory_movement(movement_type, item_id, bin_id, lot_id, qty, unit_cost, source_type, source_id)
+    SELECT 'receipt', grl.item_id, grl.to_bin_id, grl.lot_id, grl.received_qty_base, grl.unit_price, 'goods_receipt', grl.id
+    FROM goods_receipt_line grl WHERE grl.gr_id = v_gr_walk;
+
+    -- SOL-ETHANOL: QC/QA kiểm ĐẠT -> lô approved -> chuyển Tạm trữ sang Bảo quản (khả dụng).
+    INSERT INTO qc_inspection(gr_line_id, lot_id, inspected_by, result, note)
+    SELECT grl.id, grl.lot_id, v_admin, 'approved', 'QC/QA đạt dù COA lệch nhãn'
+    FROM goods_receipt_line grl WHERE grl.gr_id = v_gr_walk AND grl.lot_id = v_lot_eth;
+    UPDATE lot SET qc_status='approved' WHERE id = v_lot_eth;
+    INSERT INTO inventory_movement(movement_type, item_id, bin_id, lot_id, qty, unit_cost, source_type, source_id)
+    SELECT 'transfer', grl.item_id, grl.to_bin_id, grl.lot_id, -grl.received_qty_base, grl.unit_price, 'qc_release', grl.id
+    FROM goods_receipt_line grl WHERE grl.gr_id = v_gr_walk AND grl.lot_id = v_lot_eth;
+    INSERT INTO inventory_movement(movement_type, item_id, bin_id, lot_id, qty, unit_cost, source_type, source_id)
+    SELECT 'qc_release', grl.item_id, bn.bq_bin, grl.lot_id, grl.received_qty_base, grl.unit_price, 'qc_release', grl.id
+    FROM goods_receipt_line grl JOIN _bin bn ON bn.item_id=grl.item_id
+    WHERE grl.gr_id = v_gr_walk AND grl.lot_id = v_lot_eth;
+    RAISE NOTICE 'Bước 5c: Nhận XÁCH TAY (không PO) — PK-CARTON đạt->Bảo quản; PK-BOTTLE100 lỗi->Tạm trữ; SOL-ETHANOL COA sai->QC đạt->Bảo quản.';
+
     -- ===== BƯỚC 6: SẢN XUẤT BULK (lệnh MO SF-CREAM) =====
     -- 6a. Xuất NVL theo định mức của lệnh (production_order_material) từ bin Bảo quản.
     INSERT INTO material_issue(issue_no, mo_id, location_id, issued_by, status)
@@ -301,6 +369,86 @@ BEGIN
     RAISE NOTICE 'Bước 8: Giá vốn -> bulk SF-CREAM = % /kg ; FG-CREAM50 = % /cái.',
                  (SELECT unit_cost FROM lot WHERE id=v_lot_sf), v_fg_cost;
 
-    RAISE NOTICE '== DEMO HOÀN TẤT: kế hoạch -> MRP -> mua/nhập/QC -> SX -> giá vốn. Xem ERP.md để khám phá. ==';
+    -- ===== BƯỚC 9: CHO MƯỢN NGUYÊN LIỆU (đối tác NGOÀI) -> THEO DÕI -> NHẬN LẠI =====
+    -- Cho "Nhà máy XYZ" mượn 5 kg glycerin (lô đang tồn 12500 g, đã QC approved ở Bảo quản).
+    v_bin_gly := (SELECT bq_bin FROM _bin WHERE item_id=(SELECT id FROM item WHERE code='RM-GLYCERIN'));
+    INSERT INTO material_loan(loan_no, borrower_name, borrower_contact, location_id, expected_return_date, issued_by, note)
+    VALUES ('MLOAN-01', 'Nhà máy XYZ', 'A. Tâm 0909-xxx', v_loc, current_date + 30, v_admin, 'Cho mượn glycerin dùng tạm')
+    RETURNING id INTO v_loan;
+    INSERT INTO material_loan_line(loan_id, item_id, lot_id, from_bin_id, qty, uom_id)
+    VALUES (v_loan, (SELECT id FROM item WHERE code='RM-GLYCERIN'), v_lot_gly, v_bin_gly, 5, v_kg)  -- 5 kg = 5000 g
+    RETURNING id INTO v_loan_line;
+    -- Ledger: vật tư RỜI tồn (loan_out, -base) từ bin Bảo quản.
+    INSERT INTO inventory_movement(movement_type, item_id, bin_id, lot_id, qty, unit_cost, source_type, source_id)
+    SELECT 'loan_out', mll.item_id, mll.from_bin_id, mll.lot_id, -mll.qty_base,
+           (SELECT unit_cost FROM lot WHERE id=mll.lot_id), 'material_loan', mll.id
+    FROM material_loan_line mll WHERE mll.id = v_loan_line;
+
+    -- Nhận lại 3 kg (trả 1 phần) -> phiếu nhận 'loan_return' (KHÔNG PO), về lại Bảo quản cùng lô.
+    INSERT INTO goods_receipt(gr_no, receipt_source, po_id, supplier_id, loan_id, source_note, location_id, received_by, status)
+    VALUES ('GR-RET-01', 'loan_return', NULL, NULL, v_loan, 'Nhà máy XYZ trả lại glycerin', v_loc, v_admin, 'posted')
+    RETURNING id INTO v_gr_ret;
+    INSERT INTO goods_receipt_line(gr_id, po_line_id, loan_line_id, item_id, lot_id, to_bin_id,
+                                   declared_qty, received_qty, qty_uom_id, unit_price, qc_status, coa_status, note)
+    VALUES (v_gr_ret, NULL, v_loan_line, (SELECT id FROM item WHERE code='RM-GLYCERIN'), v_lot_gly, v_bin_gly,
+            3, 3, v_kg, 0, 'approved', 'not_required', 'Trả 1 phần; còn cho mượn lại');
+    INSERT INTO inventory_movement(movement_type, item_id, bin_id, lot_id, qty, unit_cost, source_type, source_id)
+    SELECT 'loan_return', grl.item_id, grl.to_bin_id, grl.lot_id, grl.received_qty_base,
+           (SELECT unit_cost FROM lot WHERE id=grl.lot_id), 'goods_receipt', grl.id
+    FROM goods_receipt_line grl WHERE grl.gr_id = v_gr_ret;
+    RAISE NOTICE 'Bước 9: Cho NM-XYZ mượn 5 kg glycerin (5000 g) -> nhận lại 3 kg (3000 g) -> còn cho mượn 2000 g.';
+
+    -- ===== BƯỚC 10: BÁN HÀNG (đợt 5b) — bán thường + bán hàng đang-cho-mượn (loan->sale) =====
+    -- 10a. BÁN THƯỜNG: CUST-Z mua 100 hộp FG-CREAM50 @20 (giá vốn 6.27/cái) -> xuất kho + COGS.
+    v_bin_fg := (SELECT bq_bin FROM _bin WHERE item_id=(SELECT id FROM item WHERE code='FG-CREAM50'));
+    INSERT INTO sales_order(so_no, customer_id, status, created_by, approved_by, expected_ship_date, note)
+    VALUES ('SO-DEMO-01', v_cust_z, 'confirmed', v_admin, v_admin, current_date, 'Đơn bán kem dưỡng')
+    RETURNING id INTO v_so;
+    INSERT INTO sales_order_line(so_id, item_id, ordered_qty, uom_id, unit_price)
+    VALUES (v_so, (SELECT id FROM item WHERE code='FG-CREAM50'), 100, v_cai, 20)
+    RETURNING id INTO v_so_line;
+    -- Phiếu giao (posted) -> xuất từ bin Bảo quản TP.
+    INSERT INTO sales_shipment(shipment_no, so_id, customer_id, location_id, shipped_by, status, note)
+    VALUES ('DO-DEMO-01', v_so, v_cust_z, v_loc, v_admin, 'posted', 'Giao 100 hộp')
+    RETURNING id INTO v_ship;
+    INSERT INTO sales_shipment_line(shipment_id, so_line_id, item_id, lot_id, from_bin_id, shipped_qty, uom_id, unit_price)
+    VALUES (v_ship, v_so_line, (SELECT id FROM item WHERE code='FG-CREAM50'), v_lot_fg, v_bin_fg, 100, v_cai, 20)
+    RETURNING id INTO v_ship_line;
+    -- Ledger: xuất bán (sales_issue, -base) từ bin Bảo quản — CHỈ dòng bán thường (loan_line_id NULL).
+    INSERT INTO inventory_movement(movement_type, item_id, bin_id, lot_id, qty, unit_cost, source_type, source_id)
+    SELECT 'sales_issue', ssl.item_id, ssl.from_bin_id, ssl.lot_id, -ssl.shipped_qty_base,
+           (SELECT unit_cost FROM lot WHERE id=ssl.lot_id), 'sales_shipment', ssl.id
+    FROM sales_shipment_line ssl WHERE ssl.id = v_ship_line AND ssl.loan_line_id IS NULL;
+    UPDATE sales_order SET status='shipped' WHERE id=v_so;
+    -- Hoá đơn VAT 8% (net 2000 / thuế 160 / tổng 2160) + thu 1 phần 1000 -> còn nợ 1160.
+    INSERT INTO sales_invoice(invoice_no, customer_id, due_date, tax_rate, status, created_by, note)
+    VALUES ('INV-DEMO-01', v_cust_z, current_date + 30, 8.0, 'issued', v_admin, 'HĐ kem dưỡng')
+    RETURNING id INTO v_inv_z;
+    INSERT INTO sales_invoice_line(invoice_id, shipment_line_id, item_id, qty, uom_id, unit_price)
+    VALUES (v_inv_z, v_ship_line, (SELECT id FROM item WHERE code='FG-CREAM50'), 100, v_cai, 20);
+    INSERT INTO customer_payment(payment_no, customer_id, invoice_id, amount, method, received_by)
+    VALUES ('PAY-DEMO-01', v_cust_z, v_inv_z, 1000, 'bank', v_admin);
+    UPDATE sales_invoice SET status='partially_paid' WHERE id=v_inv_z;
+
+    -- 10b. LOAN->SALE: NM-XYZ không trả 2 kg glycerin còn lại -> MUA luôn (giá bán 50/kg; giá vốn 0.04/g).
+    --   Hàng đã RỜI kho từ loan_out -> phiếu giao KHÔNG post ledger (from_bin NULL, loan_line_id set).
+    INSERT INTO sales_shipment(shipment_no, so_id, customer_id, location_id, shipped_by, status, loan_id, note)
+    VALUES ('DO-DEMO-02', NULL, v_cust_xyz, v_loc, v_admin, 'posted', v_loan, 'Bán phần glycerin đang cho mượn')
+    RETURNING id INTO v_ship_loan;
+    INSERT INTO sales_shipment_line(shipment_id, so_line_id, item_id, lot_id, from_bin_id, shipped_qty, uom_id, unit_price, loan_line_id)
+    VALUES (v_ship_loan, NULL, (SELECT id FROM item WHERE code='RM-GLYCERIN'), v_lot_gly, NULL, 2, v_kg, 50, v_loan_line)
+    RETURNING id INTO v_ship_line_loan;
+    -- (KHÔNG post inventory_movement: hàng đã trừ kho ở loan_out — chống trừ trùng/âm kho.)
+    -- Outstanding cho mượn về 0 (mượn 5000 − trả 3000 − bán 2000) -> đóng khoản mượn.
+    UPDATE material_loan SET status='closed' WHERE id=v_loan;
+    -- Hoá đơn cho phần bán (VAT 8%: net 100 / thuế 8 / tổng 108) — chưa thu -> nằm trong công nợ phải thu.
+    INSERT INTO sales_invoice(invoice_no, customer_id, due_date, tax_rate, status, created_by, note)
+    VALUES ('INV-DEMO-02', v_cust_xyz, current_date, 8.0, 'issued', v_admin, 'HĐ bán glycerin (loan->sale)')
+    RETURNING id INTO v_inv_xyz;
+    INSERT INTO sales_invoice_line(invoice_id, shipment_line_id, item_id, qty, uom_id, unit_price)
+    VALUES (v_inv_xyz, v_ship_line_loan, (SELECT id FROM item WHERE code='RM-GLYCERIN'), 2, v_kg, 50);
+    RAISE NOTICE 'Bước 10: Bán 100 hộp FG-CREAM50 (doanh thu 2000, COGS 627) + loan->sale 2 kg glycerin cho NM-XYZ -> khoản mượn ĐÓNG (outstanding 0); phải thu: Z 1160, XYZ 108.';
+
+    RAISE NOTICE '== DEMO HOÀN TẤT: kế hoạch -> MRP -> mua/nhập/QC -> SX -> giá vốn -> cho mượn/nhận lại -> BÁN HÀNG. Xem ERP.md. ==';
 END
 $$;

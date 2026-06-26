@@ -174,6 +174,78 @@ lot.unit_cost  ──►  v_inventory_valuation (định giá tồn) , v_mo_cost
 
 ---
 
+## 4b. Luồng NHẬN HÀNG (theo PO / xách tay) + COA
+
+**Ba nguồn phiếu nhận** (`goods_receipt.receipt_source`):
+- `purchase_order` — nhận theo PO (bắt buộc có `po_id`); NCC suy từ PO.
+- `walk_in` — **mua xách tay, KHÔNG qua PO**: để `po_id` / `po_line_id` / `supplier_id` = **NULL**, ghi
+  `source_note` (nguồn hàng / ai mang về). Ràng buộc `chk_gr_source_po` ép đúng: phiếu PO ⇔ có `po_id`.
+- `loan_return` — **nhận lại hàng đã CHO MƯỢN** (không PO); link về khoản mượn qua `loan_id` (xem §4c).
+
+> Vì sao cần `receipt_source` (không chỉ dựa `po_id IS NULL`)? Vì có **≥2 loại phiếu không-PO** (`walk_in` vs
+> `loan_return`) — `po_id IS NULL` không phân biệt nổi, còn `receipt_source` thì có.
+
+**Định tuyến lúc nhận** (theo `item.requires_qc`):
+
+| Loại hàng | Lúc nhận (thủ kho) | ĐẠT | KHÔNG đạt |
+|---|---|---|---|
+| `requires_qc = false` (hộp/hủ/phụ kiện) | thủ kho **duyệt ngay** | → Bảo quản (lô `approved`) ✅ khả dụng | → Tạm trữ (lô `on_hold`) ⛔ chờ trả/bỏ |
+| `requires_qc = true` (hoá chất) | đối chiếu **phiếu giao** + **COA** → nhận **Tạm trữ** (`quarantine`) **dù COA đúng/sai**, rồi **QC/QA** kiểm | QC đạt → Bảo quản ✅ | QC trượt → vẫn Tạm trữ ⛔ chờ xử lý |
+
+- **COA** ghi ở mỗi `goods_receipt_line.coa_status`: `not_required` / `missing` (thiếu) / `mismatch` (có nhưng
+  sai) / `matched` (đúng). **Phiếu giao hàng** = `goods_receipt.supplier_do_no` (có giá trị = có phiếu).
+- Tồn **khả dụng** vẫn = bin `PRESERVATION` + lô `approved` → hàng ở Tạm trữ (on_hold/quarantine) **không** khả dụng.
+- `v_receipt_variance` dùng **LEFT JOIN** PO → phiếu xách tay vẫn xem được (`tolerance_pct` NULL vì không có PO).
+
+---
+
+## 4c. CHO MƯỢN nguyên liệu (đối tác ngoài) → theo dõi → nhận lại
+
+Cho nhà máy/đối tác **bên ngoài** mượn vật tư đã nhập kho, theo dõi công nợ vật tư, rồi nhận lại (1 phần / đủ).
+
+```
+material_loan(_line)  ──(cho mượn)──►  ledger loan_out (− Bảo quản)   vật tư RỜI tồn của bạn (lô vẫn approved)
+        │  v_material_loan_status:  lent − returned = OUTSTANDING (còn cho mượn) + giá trị
+        ▼
+goods_receipt receipt_source='loan_return' (loan_id, loan_line_id)  ──►  ledger loan_return (+ Bảo quản)
+```
+
+- **Cho mượn** = `material_loan` (header: `borrower_name`, ngày, hẹn trả) + `material_loan_line` (item/lô/SL từ
+  bin Bảo quản). Ledger `loan_out` (−base): tồn & khả dụng GIẢM; lô vẫn `approved`.
+- **Nhận lại** = `goods_receipt` `receipt_source='loan_return'` (không PO), dòng có `loan_line_id` để **đối
+  chiếu** số đã trả. Mặc định về thẳng Bảo quản cùng lô (không re-QC).
+- **`v_material_loan_status`**: mỗi dòng cho mượn → `lent − returned = outstanding_qty_base` +
+  `outstanding_value` (× giá vốn lô). "Ai chưa trả" = group theo `borrower_name`.
+- **Bảo toàn giá trị**: giá trị **tồn kho** + giá trị **đang cho mượn** = không đổi (vật tư chỉ chuyển chỗ, chưa mất).
+  `fn_roll_lot_cost` LOẠI phiếu `loan_return` → giá vốn lô không bị pha loãng khi hàng mượn trả về.
+
+---
+
+## 4d. BÁN HÀNG (đợt 5b): đơn bán → giao (xuất kho + COGS) → hoá đơn (VAT) → thu tiền → công nợ
+
+```
+khách hàng ─► sales_order(_line) ─(xác nhận)─► sales_shipment(_line) ─► ledger sales_issue (− Bảo quản)
+                                                       │  COGS = shipped_qty_base × lot.unit_cost (CHỈ đọc giá lô)
+                                                       ▼
+                                       sales_invoice(_line) (VAT) ─► v_ar_aging (công nợ theo tuổi)
+                                                       ▲                      ▲
+                                       customer_payment (thu tiền) ──────────┘
+```
+
+- **Đơn bán** `sales_order(_line)` (mirror PO): `unit_price` + `line_amount` (generated). Trạng thái `so_status`.
+- **Giao hàng** `sales_shipment(_line)` (mirror GR, chiều XUẤT): app post ledger **`sales_issue` (−base)** từ bin
+  Bảo quản; **COGS** = `shipped_qty_base × lot.unit_cost` → `v_sales_margin` = doanh thu − giá vốn. Bán chỉ **đọc**
+  giá lô ⇒ `fn_roll_lot_cost`/giá vốn lô KHÔNG đổi.
+- **Hoá đơn** `sales_invoice(_line)` (VAT `tax_rate`): 1 HĐ gộp nhiều phiếu giao; `v_invoice_totals` = net/thuế/gross.
+- **Thu tiền** `customer_payment` → **`v_ar_aging`**: outstanding = gross − đã thu, chia bucket
+  `current/1-30/31-60/61-90/90+`. "Ai nợ tiền" = group theo `customer`.
+- **Bán hàng đang CHO MƯỢN (loan→sale)**: đối tác mượn không trả mà **mua luôn** → phiếu giao có
+  `loan_id`/`loan_line_id`, `from_bin_id=NULL` → **KHÔNG post ledger** (hàng đã rời kho ở `loan_out`, tránh trừ
+  trùng/âm kho). `v_material_loan_status` trừ thêm `sold_qty_base` → outstanding về 0 → đóng khoản mượn; COGS vẫn
+  ghi ở giá lô, tiền chuyển sang **phải thu**.
+
+---
+
 ## 5. Kịch bản DEMO (007): sản xuất 1000 hộp Kem dưỡng 50ml
 
 | Bước | Việc | Kết quả |
@@ -183,9 +255,12 @@ lot.unit_cost  ──►  v_inventory_valuation (định giá tồn) , v_mo_cost
 | 3 | Sinh PR `PR-DEMO-01` | 9 dòng item đi mua (NVL + bao bì) |
 | 4 | `fn_generate_production_orders` | **2 lệnh SX**: bulk SF-CREAM + thành phẩm FG-CREAM50 |
 | 5 | Mua & nhập: PO (2 NCC) → GR → QC | NVL/bao bì vào bin **Bảo quản** (mua dư an toàn: WATER 40, ARGAN 5, bao bì 1100…) |
+| 5c | Nhận **xách tay** (không PO) `GR-WALK-01`: carton / chai100 / cồn | thủ kho đạt→Bảo quản; chai lỗi→Tạm trữ (on_hold); cồn COA sai→QC đạt→Bảo quản |
 | 6 | SX bulk: xuất NVL → nhập lô `L-SF-CREAM-01` 50 kg → QC | bulk **khả dụng** |
 | 7 | Đóng gói: xuất bulk + bao bì → lô `L-FG-CREAM50-01` 1000 cái → QC | thành phẩm **khả dụng** |
 | 8 | `fn_roll_lot_cost` | bulk **61.4/kg**, FG-CREAM50 **6.27/cái** |
+| 9 | **Cho mượn & nhận lại** `MLOAN-01`: NM-XYZ mượn 5 kg glycerin → trả lại 3 kg | còn cho mượn **2000 g**; tồn kho + đang-cho-mượn **bảo toàn** |
+| 10 | **Bán hàng** `SO-DEMO-01`: CUST-Z mua 100 hộp FG-CREAM50 @20 → giao (COGS 627) → HĐ VAT 8% (2160) → thu 1000. **loan→sale**: NM-XYZ mua nốt 2 kg glycerin đang mượn | doanh thu **2000**+**100**; khoản mượn **đóng** (outstanding 0); phải thu **Z 1160 + XYZ 108** |
 
 Giá vốn 1 hộp Kem 50ml = **6.27** được cuộn từ:
 
@@ -214,6 +289,11 @@ Bulk 1kg = 35·2(nước) + 7.5·40(glycerin) + 4.2·500(argan) + 2.5·120(lô h
 | Bao nhiêu kg lô cha trong lô con | `v_lot_genealogy_alloc` |
 | Giá vốn từng lệnh / định giá tồn | `v_mo_cost`, `v_inventory_valuation` |
 | Đơn vị hợp lệ để nhập cho 1 item (UI dropdown) | `v_item_valid_uom` |
+| Cho mượn: còn cho mượn bao nhiêu / ai chưa trả | `v_material_loan_status` |
+| Bán hàng: lãi gộp (doanh thu − giá vốn) | `v_sales_margin` |
+| Hoá đơn: net / VAT / tổng | `v_invoice_totals` |
+| Công nợ phải thu theo tuổi / ai nợ tiền | `v_ar_aging` |
+| Tiến độ giao theo dòng đơn bán | `v_so_line_fulfillment` |
 
 ---
 
@@ -252,7 +332,7 @@ SELECT i.code, SUM(v.qty_on_hand) qty, MAX(v.unit_cost) gia_von, SUM(v.stock_val
 FROM v_inventory_valuation v JOIN item i ON i.id=v.item_id
 GROUP BY i.code ORDER BY gia_tri DESC NULLS LAST;
 ```
-→ FG-CREAM50 = 1000 × 6.27 = **6270**; Glycerin tồn 12500 **g** × 0.04 = **500**; tổng giá trị kho ≈ **7860**.
+→ FG-CREAM50 = **900** × 6.27 = **5643** (đã bán 100 hộp); Glycerin **kho** 10500 g × 0.04 = **420** (2000 g từng cho mượn nay đã **bán hết** — §4d); hàng xách tay (carton 150 + chai100 40 + cồn 300) = **490**; **tổng giá trị tồn kho = 7643** (giảm đúng **627** = giá vốn 100 hộp FG đã bán; loan→sale KHÔNG động kho vì hàng đã rời từ `loan_out`).
 
 ### 7.5 Kết quả MRP (nhu cầu mọi cấp)
 ```sql
@@ -332,6 +412,46 @@ JOIN storage_bin sb ON sb.id=s.bin_id JOIN warehouse_zone z ON z.id=sb.zone_id
 LEFT JOIN lot l ON l.id=s.lot_id
 ORDER BY i.code;
 ```
+
+### 7.13 Phiếu nhận XÁCH TAY (không PO) & trạng thái COA từng dòng
+```sql
+SELECT gr.gr_no, gr.receipt_source, COALESCE(gr.source_note,'(—)') AS nguon,
+       i.code, grl.received_qty, grl.qc_status, grl.coa_status
+FROM goods_receipt gr
+JOIN goods_receipt_line grl ON grl.gr_id = gr.id
+JOIN item i ON i.id = grl.item_id
+WHERE gr.receipt_source = 'walk_in'        -- po_id/supplier_id đều NULL
+ORDER BY gr.gr_no, i.code;
+```
+→ `GR-WALK-01`: PK-CARTON (`approved`/`not_required`) đã vào Bảo quản; PK-BOTTLE100 (`on_hold`) ở Tạm trữ;
+SOL-ETHANOL (`quarantine`→QC `approved`, COA `mismatch`) đã chuyển Bảo quản.
+
+### 7.14 Cho mượn nguyên liệu: còn cho mượn bao nhiêu & AI CHƯA TRẢ
+```sql
+-- chi tiết từng khoản
+SELECT loan_no, borrower_name, i.code,
+       lent_qty_base "cho_mượn", returned_qty_base "đã_trả",
+       outstanding_qty_base "còn_nợ", outstanding_value "giá_trị_còn"
+FROM v_material_loan_status s JOIN item i ON i.id=s.item_id
+ORDER BY loan_no;
+-- tổng theo đối tác (ai chưa trả)
+SELECT borrower_name, SUM(outstanding_qty_base) "còn_nợ", SUM(outstanding_value) "giá_trị"
+FROM v_material_loan_status GROUP BY borrower_name HAVING SUM(outstanding_qty_base) > 0;
+```
+→ `MLOAN-01` / **Nhà máy XYZ**: mượn 5000 g glycerin → trả 3000 g → **mua nốt 2000 g** (loan→sale, §4d) ⇒
+`outstanding = 0`, khoản mượn **closed**. Phần đã bán chuyển sang **công nợ phải thu** (xem §7.15).
+
+### 7.15 Bán hàng: lãi gộp, hoá đơn VAT, công nợ phải thu (AR aging)
+```sql
+-- lãi gộp từng dòng giao (doanh thu − giá vốn lô)
+SELECT shipment_no, revenue "doanh_thu", cogs "giá_vốn", margin "lãi_gộp" FROM v_sales_margin ORDER BY shipment_no;
+-- hoá đơn: trước thuế / VAT / sau thuế
+SELECT invoice_no, net_amount, tax_amount, gross_amount FROM v_invoice_totals ORDER BY invoice_no;
+-- AI NỢ TIỀN (công nợ phải thu còn lại theo khách)
+SELECT customer_name, SUM(outstanding_amount) "còn_nợ" FROM v_ar_aging GROUP BY customer_name HAVING SUM(outstanding_amount) > 0;
+```
+→ Bán thường `DO-DEMO-01` lãi gộp **2000 − 627 = 1373**; loan→sale `DO-DEMO-02` **100 − 80 = 20**. Hoá đơn:
+`INV-DEMO-01` **2000/160/2160** (thu 1000 → còn **1160**), `INV-DEMO-02` **100/8/108**. Phải thu: **Z 1160 + XYZ 108**.
 
 ---
 

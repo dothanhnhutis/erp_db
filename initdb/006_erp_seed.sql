@@ -33,6 +33,14 @@ INSERT INTO supplier (code, name, tax_code, payment_terms, prepay_required, phon
     ('SUP-FRAG', 'Cty Hương Liệu Quốc Tế',     '0303333333', 'Trả trước 50%',        true,  '028-3833-3333');
 
 -- -----------------------------------------------------------------------------
+-- 2b. KHÁCH HÀNG (đợt 5b — bán hàng). credit_days -> hạn công nợ tính due_date hoá đơn.
+--     CUST-XYZ = "Nhà máy XYZ" (đối tác từng MƯỢN nguyên liệu — khi không trả sẽ MUA luôn: loan->sale).
+-- -----------------------------------------------------------------------------
+INSERT INTO customer (code, name, tax_code, payment_terms, credit_days, phone) VALUES
+    ('CUST-Z',   'Cửa hàng Mỹ Phẩm Z',  '0304444444', 'Công nợ 30 ngày', 30, '028-3844-4444'),
+    ('CUST-XYZ', 'Nhà máy XYZ',         '0305555555', 'Thanh toán ngay',  0, '028-3855-5555');
+
+-- -----------------------------------------------------------------------------
 -- 3. ITEM MASTER — 17 item, 5 loại (item_type quyết định khu lưu & yêu cầu QC)
 --    base_uom_id = đơn vị CHÍNH để lưu kho. requires_qc = bắt buộc IQC khi nhập.
 -- -----------------------------------------------------------------------------
